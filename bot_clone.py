@@ -157,6 +157,48 @@ BTC_RANGING_SIZE_MULT = 0.0       # 0.0 = pause ALL momentum/breakout entries wh
 BTC_MEANREV_SIZE_MULT = 0.5       # Mean-reversion entries use 50% normal sizing in ranging markets
 BTC_MEANREV_Z_THRESHOLD = 2.0     # z-score magnitude for mean-rev entry
 BTC_MEANREV_Z_WINDOW = 50         # Lookback ticks for z-score calculation
+
+# ── v29.4.1: Fear & Greed Index ──
+FEAR_GREED_ENABLED = True          # Master switch for Fear & Greed sizing
+FEAR_GREED_REFRESH_CYCLES = 200    # Re-fetch every 200 cycles (~100 min at 30s poll)
+FEAR_GREED_EXTREME_FEAR = 25       # Below this = Extreme Fear → boost size
+FEAR_GREED_EXTREME_GREED = 75      # Above this = Extreme Greed → reduce size
+FEAR_GREED_FEAR_MULT = 1.30        # Size multiplier in Extreme Fear (buy the dip)
+FEAR_GREED_GREED_MULT = 0.70       # Size multiplier in Extreme Greed (trim exposure)
+FEAR_GREED_NEUTRAL_MULT = 1.0      # Between 25-75 = neutral, no adjustment
+_fear_greed_value = 50             # Runtime: last fetched index value (0-100)
+_fear_greed_label = "Neutral"      # Runtime: last fetched label
+_fear_greed_last_cycle = -999      # Runtime: cycle of last successful fetch
+
+# ── v29.4.1: Triple-Confirm Mean Reversion (BB + RSI + Z-Score) ──
+TRIPLE_MEANREV_ENABLED = True      # Master switch
+TRIPLE_MEANREV_BB_WINDOW = 20      # Bollinger Band lookback
+TRIPLE_MEANREV_BB_STD = 2.0        # BB standard deviation multiplier
+TRIPLE_MEANREV_RSI_WINDOW = 14     # RSI lookback period
+TRIPLE_MEANREV_RSI_OVERSOLD = 30   # RSI below this = oversold (long)
+TRIPLE_MEANREV_RSI_OVERBOUGHT = 70 # RSI above this = overbought (short)
+TRIPLE_MEANREV_Z_THRESHOLD = 2.0   # Z-score threshold for entry
+TRIPLE_MEANREV_HIGH_CONV_Z = 3.0   # Z-score for high-conviction (+25% size)
+
+# ── v29.4.1: Opening Range Breakout (ORB) ──
+ORB_ENABLED = False                 # Disabled by default (needs Alpaca API key)
+ORB_RANGE_MINUTES = 30              # First 30 minutes define the range
+ORB_VOLUME_CONFIRM_MULT = 1.5      # Breakout volume must exceed 1.5x avg
+ORB_TARGET_RANGE_MULT = 2.0        # Profit target = 2x the opening range
+ORB_STOP_RANGE_MULT = 0.5          # Stop loss = 0.5x the opening range
+ORB_MAX_POSITIONS = 3               # Max concurrent ORB positions
+ORB_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "TSLA"]  # Default watchlist
+ORB_API_KEY = ""                    # Alpaca API key (set in env or config)
+ORB_API_SECRET = ""                 # Alpaca API secret
+ORB_BASE_URL = "https://paper-api.alpaca.markets"  # Paper trading endpoint
+_orb_ranges = {}                    # Runtime: symbol → {high, low, volume, ready}
+
+# ── v29.4.1: Smart DCA Sizing ──
+SMART_DCA_ENABLED = True            # Master switch
+SMART_DCA_EXTREME_FEAR_THRESHOLD = 20  # F&G below this triggers DCA boost
+SMART_DCA_BOOST_PCT = 0.40         # +40% extra position size in extreme fear
+SMART_DCA_MAX_POSITIONS = 5         # Max positions that get DCA boost per cycle
+
 CASCADE_BLOCK_CYCLES = 10         # Block entries for N cycles during cascade
 MIN_HOLD_CYCLES = 120             # v29.3.5: was 60 — momentum strategies need longer to play out (120 cycles ≈ 1hr at POLL=30s)
 MIN_HOLD_CYCLES_MEANREV = 60      # Mean-reversion is faster — keep original 60 cycle minimum
@@ -7395,6 +7437,201 @@ def btc_meanrev_scan(tickers):
     return candidates[:5]  # Top 5 candidates
 
 
+# ── v29.4.1: Fear & Greed Index ──
+
+def fetch_fear_greed_index():
+    """Fetch the Fear & Greed Index from alternative.me free API.
+    Returns (value: int 0-100, label: str) or (50, 'Neutral') on failure.
+    Cached via _fear_greed_last_cycle to avoid over-fetching."""
+    global _fear_greed_value, _fear_greed_label, _fear_greed_last_cycle
+    try:
+        resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "data" in data and len(data["data"]) > 0:
+                _fear_greed_value = int(data["data"][0]["value"])
+                _fear_greed_label = data["data"][0].get("value_classification", "Unknown")
+                _fear_greed_last_cycle = _current_cycle
+                logger.info(f"[F&G] Fear & Greed Index: {_fear_greed_value} ({_fear_greed_label})")
+                return _fear_greed_value, _fear_greed_label
+        logger.warning(f"[F&G] API returned status {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[F&G] Fetch failed: {e}")
+    return _fear_greed_value, _fear_greed_label  # Return last known value
+
+
+def fear_greed_size_mult():
+    """Return position size multiplier based on current Fear & Greed Index.
+    Extreme Fear (<25) = 1.30x (buy the blood), Extreme Greed (>75) = 0.70x, else 1.0."""
+    if not FEAR_GREED_ENABLED:
+        return 1.0
+    if _fear_greed_value < FEAR_GREED_EXTREME_FEAR:
+        return FEAR_GREED_FEAR_MULT
+    elif _fear_greed_value > FEAR_GREED_EXTREME_GREED:
+        return FEAR_GREED_GREED_MULT
+    return FEAR_GREED_NEUTRAL_MULT
+
+
+def smart_dca_size_mult():
+    """Return DCA boost multiplier when in Extreme Fear territory.
+    F&G < 20 = +40% extra size for mean-rev / long entries."""
+    if not SMART_DCA_ENABLED or not FEAR_GREED_ENABLED:
+        return 1.0
+    if _fear_greed_value < SMART_DCA_EXTREME_FEAR_THRESHOLD:
+        return 1.0 + SMART_DCA_BOOST_PCT  # 1.40x
+    return 1.0
+
+
+# ── v29.4.1: Triple-Confirm Mean Reversion ──
+
+def compute_rsi(prices_list, window=14):
+    """Compute RSI from a price list. Returns 50.0 if insufficient data."""
+    if len(prices_list) < window + 1:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(-window, 0):
+        delta = prices_list[i] - prices_list[i - 1]
+        if delta > 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(delta))
+    avg_gain = sum(gains) / window
+    avg_loss = sum(losses) / window
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_bollinger(prices_list, window=20, num_std=2.0):
+    """Compute Bollinger Bands. Returns (upper, middle, lower) or None if insufficient data."""
+    if len(prices_list) < window:
+        return None
+    window_slice = prices_list[-window:]
+    middle = sum(window_slice) / len(window_slice)
+    variance = sum((p - middle) ** 2 for p in window_slice) / len(window_slice)
+    std = variance ** 0.5
+    if std == 0:
+        return None
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return upper, middle, lower
+
+
+def triple_confirm_meanrev(coin, z_score):
+    """Triple-Confirm Mean Reversion: requires BB + RSI + Z-Score all confirming.
+    Returns (confirmed: bool, direction: str, conviction_boost: float, details: dict).
+    conviction_boost: 0.0 = base, 0.25 = high conviction (z > 3.0)."""
+    if not TRIPLE_MEANREV_ENABLED:
+        return False, "", 0.0, {}
+
+    hist = prices_cache.get(coin, [])
+    if len(hist) < max(TRIPLE_MEANREV_BB_WINDOW, TRIPLE_MEANREV_RSI_WINDOW + 1, 20):
+        return False, "", 0.0, {"reason": "insufficient_data"}
+
+    # Component 1: Z-Score (already computed by caller)
+    z_ok = abs(z_score) >= TRIPLE_MEANREV_Z_THRESHOLD
+
+    # Component 2: Bollinger Bands
+    bb = compute_bollinger(hist, TRIPLE_MEANREV_BB_WINDOW, TRIPLE_MEANREV_BB_STD)
+    if bb is None:
+        return False, "", 0.0, {"reason": "bb_calc_failed"}
+    upper, middle, lower = bb
+    price = hist[-1]
+    bb_oversold = price <= lower
+    bb_overbought = price >= upper
+
+    # Component 3: RSI
+    rsi = compute_rsi(hist, TRIPLE_MEANREV_RSI_WINDOW)
+    rsi_oversold = rsi <= TRIPLE_MEANREV_RSI_OVERSOLD
+    rsi_overbought = rsi >= TRIPLE_MEANREV_RSI_OVERBOUGHT
+
+    details = {"z": z_score, "rsi": rsi, "bb_upper": upper, "bb_lower": lower, "price": price}
+
+    # LONG signal: z < -2, price below lower BB, RSI oversold
+    if z_score < -TRIPLE_MEANREV_Z_THRESHOLD and bb_oversold and rsi_oversold:
+        boost = 0.25 if abs(z_score) >= TRIPLE_MEANREV_HIGH_CONV_Z else 0.0
+        return True, "long", boost, details
+
+    # SHORT signal: z > 2, price above upper BB, RSI overbought
+    if z_score > TRIPLE_MEANREV_Z_THRESHOLD and bb_overbought and rsi_overbought:
+        boost = 0.25 if abs(z_score) >= TRIPLE_MEANREV_HIGH_CONV_Z else 0.0
+        return True, "short", boost, details
+
+    return False, "", 0.0, details
+
+
+# ── v29.4.1: Opening Range Breakout (ORB) ──
+
+def orb_fetch_opening_range():
+    """Fetch opening range data for ORB symbols using Alpaca API.
+    Populates _orb_ranges with {symbol: {high, low, avg_vol, ready}}.
+    Only runs if ORB_ENABLED and API keys are set."""
+    global _orb_ranges
+    if not ORB_ENABLED or not ORB_API_KEY or not ORB_API_SECRET:
+        return
+    try:
+        headers = {
+            "APCA-API-KEY-ID": ORB_API_KEY,
+            "APCA-API-SECRET-KEY": ORB_API_SECRET
+        }
+        for sym in ORB_SYMBOLS:
+            # Fetch today's bars (1-min) for first ORB_RANGE_MINUTES minutes
+            resp = requests.get(
+                f"{ORB_BASE_URL}/v2/stocks/{sym}/bars",
+                headers=headers,
+                params={"timeframe": "1Min", "limit": ORB_RANGE_MINUTES, "feed": "iex"},
+                timeout=10
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[ORB] Failed to fetch bars for {sym}: {resp.status_code}")
+                continue
+            bars = resp.json().get("bars", [])
+            if len(bars) < ORB_RANGE_MINUTES * 0.8:  # Need at least 80% of bars
+                _orb_ranges[sym] = {"high": 0, "low": 0, "avg_vol": 0, "ready": False}
+                continue
+            highs = [b["h"] for b in bars]
+            lows = [b["l"] for b in bars]
+            vols = [b["v"] for b in bars]
+            _orb_ranges[sym] = {
+                "high": max(highs),
+                "low": min(lows),
+                "avg_vol": sum(vols) / len(vols) if vols else 0,
+                "ready": True
+            }
+            logger.info(f"[ORB] {sym} opening range: ${min(lows):.2f}-${max(highs):.2f} vol_avg={sum(vols) / len(vols):.0f}")
+    except Exception as e:
+        logger.warning(f"[ORB] Opening range fetch failed: {e}")
+
+
+def orb_check_breakout(symbol, current_price, current_volume):
+    """Check if a symbol is breaking out of its opening range.
+    Returns (breakout: bool, direction: str, target: float, stop: float) or (False, '', 0, 0)."""
+    if not ORB_ENABLED or symbol not in _orb_ranges:
+        return False, "", 0.0, 0.0
+    rng = _orb_ranges[symbol]
+    if not rng["ready"] or rng["high"] <= rng["low"]:
+        return False, "", 0.0, 0.0
+    range_size = rng["high"] - rng["low"]
+    # Volume confirmation: current bar volume must exceed 1.5x average
+    if rng["avg_vol"] > 0 and current_volume < rng["avg_vol"] * ORB_VOLUME_CONFIRM_MULT:
+        return False, "", 0.0, 0.0
+    # Bullish breakout: price above opening range high
+    if current_price > rng["high"]:
+        target = rng["high"] + range_size * ORB_TARGET_RANGE_MULT
+        stop = rng["high"] - range_size * ORB_STOP_RANGE_MULT
+        return True, "long", target, stop
+    # Bearish breakout: price below opening range low
+    if current_price < rng["low"]:
+        target = rng["low"] - range_size * ORB_TARGET_RANGE_MULT
+        stop = rng["low"] + range_size * ORB_STOP_RANGE_MULT
+        return True, "short", target, stop
+    return False, "", 0.0, 0.0
+
+
 # ── Win Rate Filters: reject bad trades before they happen ──
 
 def is_choppy(coin, window=20):
@@ -10847,6 +11084,14 @@ def main():
             # v29.4.0: Portfolio heat check (Item 10, 24, 26)
             _heat_ok = portfolio_heat_allows_entry(wallet, prices)
 
+            # v29.4.1: Fear & Greed Index — refresh periodically
+            if FEAR_GREED_ENABLED and (cycle - _fear_greed_last_cycle) >= FEAR_GREED_REFRESH_CYCLES:
+                fetch_fear_greed_index()
+            _fg_size_mult = fear_greed_size_mult()
+            _dca_size_mult = smart_dca_size_mult()
+            if cycle % 50 == 0 and FEAR_GREED_ENABLED:
+                logger.info(f"[F&G] cycle={cycle} index={_fear_greed_value} ({_fear_greed_label}) size_mult={_fg_size_mult:.2f} dca_mult={_dca_size_mult:.2f}")
+
             # v29.4.0: BTC Market Condition Gate — pause momentum/breakout when BTC is ranging
             _btc_condition, _btc_move = btc_market_condition()
             _btc_ranging = (_btc_condition == "RANGING")
@@ -11138,6 +11383,8 @@ def main():
                         amount *= size_mult  # off-peak × adaptive × warmup ramp
                         amount *= _health_size_mult  # health-score graduated scaling
                         amount *= _brain.get("size_mult", 1.0)  # Brain mood-based sizing adjustment
+                        amount *= _fg_size_mult  # v29.4.1: Fear & Greed Index sizing
+                        amount *= _dca_size_mult  # v29.4.1: Smart DCA boost in Extreme Fear
                         amount *= _choppy_size_mult  # CHOPPY regime: 70% size, else 1.0
                         amount *= _sideways_size_mult  # Sideways market: scale down proportionally
                         amount *= _trend_size_boost  # +10% in strong trends (clean_trends≥75%, not CHOPPY)
@@ -11436,6 +11683,7 @@ def main():
                         amount *= size_mult  # off-peak × adaptive × warmup ramp
                         amount *= _health_size_mult  # health-score graduated scaling
                         amount *= _brain.get("size_mult", 1.0)  # Brain mood-based sizing adjustment
+                        amount *= _fg_size_mult  # v29.4.1: Fear & Greed Index sizing (applies to shorts too)
                         amount *= _choppy_size_mult  # CHOPPY regime: 70% size, else 1.0
                         amount *= _sideways_size_mult  # Sideways market: scale down proportionally
                         amount *= _trend_size_boost  # +10% in strong trends (clean_trends≥75%, not CHOPPY)
@@ -11614,6 +11862,14 @@ def main():
                         # Min activity guard: relax z-score threshold when idle (2.0 → 1.8 at max tier)
                         _mr_z_threshold = 2.0 - (_activity_tier * 0.07) if _activity_tier > 0 else 2.0
                         if z < -_mr_z_threshold and len(wallet.longs) < _mr_long_limit and _usable_cash > 50:
+                            # v29.4.1: Triple-Confirm Mean Reversion (BB + RSI + Z-Score)
+                            _tc_ok, _tc_dir, _tc_boost, _tc_detail = triple_confirm_meanrev(coin, z)
+                            if TRIPLE_MEANREV_ENABLED and not _tc_ok:
+                                shadow.log_signal(coin, "long", z, "triple_meanrev_unconfirmed", taken=False, strategy="mean_rev")
+                                logger.debug(f"[TRIPLE_MR] {coin} LONG z={z:.2f} — BB/RSI not confirming (rsi={_tc_detail.get('rsi', 0):.1f})")
+                                continue
+                            if TRIPLE_MEANREV_ENABLED and _tc_ok and _tc_boost > 0:
+                                logger.info(f"[TRIPLE_MR] {coin} LONG HIGH-CONV z={z:.2f} rsi={_tc_detail.get('rsi', 0):.1f} — +{_tc_boost*100:.0f}% size boost")
                             # Conviction override for mean-rev: uses z-score as signal strength
                             _conv_mr, _conv_mr_skipped, _conv_mr_tier = conviction_override_active(z, 0, "mean_rev", regime=enhanced_regime)
                             if _conv_mr:
@@ -11654,6 +11910,8 @@ def main():
                             amt *= size_mult  # off-peak × adaptive × warmup ramp
                             amt *= _health_size_mult  # health-score graduated scaling
                             amt *= _brain.get("size_mult", 1.0)  # Brain mood-based sizing adjustment
+                            amt *= _fg_size_mult  # v29.4.1: Fear & Greed Index sizing
+                            amt *= _dca_size_mult  # v29.4.1: Smart DCA boost in Extreme Fear
                             # Multiplier stacking floor: never reduce below 25%
                             if _amt_before_mults_mr > 0 and amt < _amt_before_mults_mr * 0.25:
                                 amt = _amt_before_mults_mr * 0.25
@@ -11666,6 +11924,10 @@ def main():
                             elif _zscore_mr > 3.0:
                                 amt *= 1.15
                                 logger.debug(f"[SIG_BOOST] {coin} MR-LONG: strong z-score ({_zscore_mr:.2f}) +15%")
+                            # v29.4.1: Triple-confirm conviction boost
+                            if TRIPLE_MEANREV_ENABLED and _tc_ok and _tc_boost > 0:
+                                amt *= (1.0 + _tc_boost)
+                                logger.debug(f"[TRIPLE_MR_BOOST] {coin} MR-LONG: +{_tc_boost*100:.0f}% triple-confirm conviction")
                             amt = min(amt, wallet.value(prices) * 0.30)  # Safety net: 30% portfolio hard cap
                             amt = min(amt, max_by_risk_mr)  # Re-enforce risk cap after boost
                             if amt < 15 and amt > 0 and max_by_risk_mr >= 15:
@@ -11728,6 +11990,14 @@ def main():
                         elif z < -_mr_z_threshold and len(wallet.longs) >= _mr_long_limit:
                             shadow.log_signal(coin, "long", z, "position_limit", taken=False, strategy="mean_rev")
                         elif z > _mr_z_threshold and len(wallet.shorts) < _mr_short_limit and _usable_cash > 50:
+                            # v29.4.1: Triple-Confirm Mean Reversion (BB + RSI + Z-Score) — SHORT
+                            _tcs_ok, _tcs_dir, _tcs_boost, _tcs_detail = triple_confirm_meanrev(coin, z)
+                            if TRIPLE_MEANREV_ENABLED and not _tcs_ok:
+                                shadow.log_signal(coin, "short", z, "triple_meanrev_unconfirmed", taken=False, strategy="mean_rev")
+                                logger.debug(f"[TRIPLE_MR] {coin} SHORT z={z:.2f} — BB/RSI not confirming (rsi={_tcs_detail.get('rsi', 0):.1f})")
+                                continue
+                            if TRIPLE_MEANREV_ENABLED and _tcs_ok and _tcs_boost > 0:
+                                logger.info(f"[TRIPLE_MR] {coin} SHORT HIGH-CONV z={z:.2f} rsi={_tcs_detail.get('rsi', 0):.1f} — +{_tcs_boost*100:.0f}% size boost")
                             # Conviction override for mean-rev short: uses z-score as signal strength
                             _conv_ms, _conv_ms_skipped, _conv_ms_tier = conviction_override_active(z, 0, "mean_rev", regime=enhanced_regime)
                             if _conv_ms:
@@ -11768,6 +12038,7 @@ def main():
                             amt *= size_mult  # off-peak × adaptive × warmup ramp
                             amt *= _health_size_mult  # health-score graduated scaling
                             amt *= _brain.get("size_mult", 1.0)  # Brain mood-based sizing adjustment
+                            amt *= _fg_size_mult  # v29.4.1: Fear & Greed Index sizing
                             # Multiplier stacking floor: never reduce below 25%
                             if _amt_before_mults_ms > 0 and amt < _amt_before_mults_ms * 0.25:
                                 amt = _amt_before_mults_ms * 0.25
@@ -11780,6 +12051,10 @@ def main():
                             elif _zscore_ms > 3.0:
                                 amt *= 1.15
                                 logger.debug(f"[SIG_BOOST] {coin} MR-SHORT: strong z-score ({_zscore_ms:.2f}) +15%")
+                            # v29.4.1: Triple-confirm conviction boost
+                            if TRIPLE_MEANREV_ENABLED and _tcs_ok and _tcs_boost > 0:
+                                amt *= (1.0 + _tcs_boost)
+                                logger.debug(f"[TRIPLE_MR_BOOST] {coin} MR-SHORT: +{_tcs_boost*100:.0f}% triple-confirm conviction")
                             amt = min(amt, wallet.value(prices) * 0.30)  # Safety net: 30% portfolio hard cap
                             amt = min(amt, max_by_risk_ms)  # Re-enforce risk cap after boost
                             if amt < 15 and amt > 0 and max_by_risk_ms >= 15:
@@ -11961,6 +12236,8 @@ def main():
                             amt *= size_mult  # off-peak × adaptive × warmup ramp
                             amt *= _health_size_mult  # health-score graduated scaling
                             amt *= _brain.get("size_mult", 1.0)  # Brain mood-based sizing adjustment
+                            amt *= _fg_size_mult  # v29.4.1: Fear & Greed Index sizing
+                            amt *= _dca_size_mult  # v29.4.1: Smart DCA boost in Extreme Fear
                             # Multiplier stacking floor: never reduce below 25%
                             if _amt_before_mults_bo > 0 and amt < _amt_before_mults_bo * 0.25:
                                 amt = _amt_before_mults_bo * 0.25
@@ -12075,6 +12352,7 @@ def main():
                             amt *= size_mult  # off-peak × adaptive × warmup ramp
                             amt *= _health_size_mult  # health-score graduated scaling
                             amt *= _brain.get("size_mult", 1.0)  # Brain mood-based sizing adjustment
+                            amt *= _fg_size_mult  # v29.4.1: Fear & Greed Index sizing
                             # Multiplier stacking floor: never reduce below 25%
                             if _amt_before_mults_bs > 0 and amt < _amt_before_mults_bs * 0.25:
                                 amt = _amt_before_mults_bs * 0.25
