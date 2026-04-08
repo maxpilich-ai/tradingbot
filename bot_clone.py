@@ -32,7 +32,12 @@ DYNAMIC_BLACKLIST = {
     "ALGO", "RIVER", "BCH",       # v29.3.2 original: trap coins, ATR loopholes
     "TEST", "PTB",                 # Execution failures / test artifacts
     "HYPE", "UNKNOWN",            # v29.3.3: auto-flagged <25% WR, high consec loss streaks
+    "RED",                         # v29.4.1: fake data spikes every cycle
 }
+
+# v29.4.1 — Coin Whitelist: only trade these 20 high-liquidity coins
+COIN_WHITELIST = {"BTC", "XBT", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "LINK", "DOT", "MATIC", "UNI", "ATOM", "NEAR", "APT", "SUI", "DOGE", "LTC", "ETC", "FIL"}
+WHITELIST_ONLY = True
 
 # v29.3.2 — Volatility circuit breaker: pause new entries when market vol > 5%
 VOLATILITY_CIRCUIT_BREAKER = 5.0
@@ -139,7 +144,7 @@ DECISION_SAFE_MODE = True         # True = reduce size aggressively instead of b
 # ── Professional Execution Settings ──
 PAPER_MODE = True                 # True = paper trading (wallet only), False = Kraken API (future)
 SIMULATED_SLIPPAGE_PCT = 0.05    # 0.05% adverse slippage on every fill
-MAX_SPREAD_PCT = 0.60            # Was 0.30% — blocked GHST (0.64%) and other volatile small-caps. 0.60% lets them through while still filtering garbage
+MAX_SPREAD_PCT = 0.20            # v29.4.1: tightened — whitelist coins all have tight spreads (was 0.60%)
 MIN_ORDER_USD = 5                # Minimum order size in USD (lowered for paper trading)
 GLOBAL_RISK_CAP_PCT = 12.0       # v29.3.5: was 3.0 — only allowed 2 of 8 slots. 12% = 8 × 1.5% risk per trade
 GAP_RISK_MULTIPLIER = 1.2         # v29.4.0: 1.2x SL gap (was 1.5 — tighter gap for paper trading)
@@ -215,8 +220,8 @@ PRICE_STALE_ENTRY_CYCLES = 5     # Max cycles since last fresh price for entry
 SL_BASE_PCT = 0.8                 # Stop-loss base percentage (before ATR scaling)
 TP_BASE_PCT = 0.4                 # Take-profit base percentage (floor)
 ATR_SL_MULTIPLIER = 0.7           # ATR multiplier for dynamic SL: SL = max(SL_BASE_PCT, ATR * this)
-TP_RATIO_NORMAL = 1.6             # TP:SL ratio for normal conditions
-TP_RATIO_TRENDING = 1.8           # TP:SL ratio for trending conditions
+TP_RATIO_NORMAL = 3.2             # v29.4.1: raised from 1.6 — required for profitability after Kraken 0.52% RT fees
+TP_RATIO_TRENDING = 3.5           # v29.4.1: raised from 1.8 — trending conditions get wider TP
 PP_TIMEOUT_MAX = 200              # Profit protection maximum timeout in cycles
 SLOW_BLEED_THRESHOLD = -0.3       # PnL threshold for slow bleed exit (%)
 PP_TRIGGER_MULTIPLIER = 0.7       # Early PP triggers at this fraction of TP target
@@ -350,7 +355,7 @@ SAFE_MODE_SIZE_MULT = 0.5             # Cut size 50% in safe mode
 # ── Runtime Stability ──
 STABILITY_WARMUP_CYCLES = 300         # Disable aggressive safety for first N cycles
 MAX_CONSECUTIVE_ERRORS = 50           # Only halt after this many back-to-back exceptions
-CYCLE_TIMEOUT_SEC = 30                # Skip cycle if it takes longer than this
+CYCLE_TIMEOUT_SEC = 30                # v29.4.1: restored to 30 — safe default even with whitelist
 HEARTBEAT_INTERVAL = 50               # Log heartbeat every N cycles
 API_RETRY_STARTUP = 5                 # Retry API discovery this many times on startup
 API_RETRY_DELAY = 10                  # Seconds between startup retries
@@ -9201,22 +9206,29 @@ def prefilter_tradable_pairs(tickers, min_vol=None):
         min_vol = SCAN_PREFILTER_MIN_VOL
     tradable = set()
     lo_atr, hi_atr = SCAN_PREFILTER_ATR_RANGE
+    _wl_skipped = 0
     for pair, t in tickers.items():
         try:
             price = t.get("price", 0)
             vol = t.get("vol", 0)
+            # v29.4.1: Whitelist filter — only trade approved coins
+            coin = to_short_name(pair)
+            if WHITELIST_ONLY and coin not in COIN_WHITELIST:
+                _wl_skipped += 1
+                continue
             if vol < min_vol:
                 continue
             if price <= 0 or price > 1e8:
                 continue
             # ATR sanity — use short name for cache lookup
-            coin = to_short_name(pair)
             atr = coin_atr(coin)
             if atr < lo_atr or atr > hi_atr:
                 continue
             tradable.add(pair)
         except Exception:
             pass
+    if _wl_skipped > 0:
+        logger.debug(f"[WHITELIST] Skipped {_wl_skipped} pairs not in COIN_WHITELIST ({len(tradable)} passed)")
     return tradable
 
 
@@ -9744,6 +9756,89 @@ def preflight_sizing_report(wallet_ref, prices_ref, ranked_list, pair_names_map,
         print(f"  PRE-FLIGHT ERROR: {e}")
 
 
+# ── v29.4.1: SMC/ICT Strategy — Liquidity Sweep + FVG + Order Block ──
+
+def smc_ict_signal(coin, prices):
+    """
+    SMC/ICT Strategy: Liquidity Sweep + FVG + Order Block
+    Returns (direction, confidence_score, entry_price, stop_pct, tp_pct) or None
+    Rules:
+    - Find swing low/high (support/resistance) on last 50 candles
+    - Detect liquidity sweep: price breaks below swing low by 0.3-0.8%
+    - Find FVG: 3-candle structure where candle 2 is large, gap between c1.low and c3.high
+    - Entry: price pulls back into FVG zone (50-75% depth)
+    - Stop: below sweep low, max 1.5%
+    - TP: minimum 3x stop (for fee coverage)
+    - Score: 0-10 based on conditions met, only trade 6+
+    """
+    if len(prices) < 50:
+        return None
+    try:
+        recent = prices[-50:]
+
+        # Find swing low (support)
+        swing_low = min(recent[-30:-5])
+        swing_low_idx = recent.index(swing_low) if swing_low in recent else -1
+        current = prices[-1]
+        prev5 = prices[-6:-1]
+
+        # Detect sweep: price went below swing_low then recovered
+        swept = any(p < swing_low * 0.997 for p in prev5)  # 0.3% sweep minimum
+        if not swept:
+            return None
+
+        sweep_low = min(prev5)
+        sweep_pct = (swing_low - sweep_low) / swing_low
+        if sweep_pct > 0.008:  # max 0.8% sweep
+            return None
+
+        # Find FVG: look for gap in last 5 candles after sweep
+        # Simplified: large candle followed by recovery leaves imbalance
+        if len(prices) < 5:
+            return None
+        c1_low = prices[-5]
+        c3_high = prices[-3]
+        fvg_low = min(c1_low, c3_high)
+        fvg_high = max(c1_low, c3_high)
+        fvg_size = (fvg_high - fvg_low) / fvg_low
+        if fvg_size < 0.002:  # FVG must be at least 0.2%
+            return None
+
+        # Entry: price currently in FVG zone (50-75% depth from top)
+        fvg_entry_low = fvg_low + (fvg_high - fvg_low) * 0.25
+        fvg_entry_high = fvg_low + (fvg_high - fvg_low) * 0.75
+        in_fvg = fvg_entry_low <= current <= fvg_entry_high
+        if not in_fvg:
+            return None
+
+        # Score the setup
+        score = 0
+        if sweep_pct >= 0.003: score += 3  # clean sweep
+        if fvg_size >= 0.004: score += 2    # large FVG
+        if current <= fvg_entry_high: score += 2  # price in entry zone
+        if current > sweep_low * 1.001: score += 2  # recovery confirmed
+        if len([p for p in recent[-10:] if p > swing_low]) > 5: score += 1  # bullish bias
+
+        if score < 6:
+            return None
+
+        # Stop: below sweep low + buffer, capped at 1.5%
+        stop_pct = max(1.0, sweep_pct * 100 + 0.3)  # sweep depth + 0.3% buffer
+        stop_pct = min(stop_pct, 1.5)  # hard cap at 1.5%
+
+        # TP: minimum 3x stop for fee coverage (0.52% RT on Kraken)
+        tp_pct = max(stop_pct * 3.0, 3.0)  # at least 3x R:R or 3.0% absolute floor
+
+        logger.info(f"[SMC/ICT] {coin} LONG signal: score={score}/10 sweep={sweep_pct*100:.2f}% "
+                     f"fvg={fvg_size*100:.2f}% stop={stop_pct:.2f}% tp={tp_pct:.2f}%")
+
+        return ("long", score, current, stop_pct, tp_pct)
+
+    except Exception as e:
+        logger.debug(f"[SMC/ICT] {coin} error: {e}")
+        return None
+
+
 # ── Main ──
 def main():
     if "--reset" in sys.argv:
@@ -9751,6 +9846,24 @@ def main():
             os.remove(STATE_FILE)
         print("  Reset. Run again without --reset.")
         return
+
+    # v29.4.1: Delete Bayesian optimizer params to prevent overriding manual config
+    _opt_params_path = os.path.join("logs", "optimal_params.json")
+    if os.path.exists(_opt_params_path):
+        try:
+            os.remove(_opt_params_path)
+            print("  [CLEANUP] Deleted logs/optimal_params.json — manual config preserved")
+            logger.info("[STARTUP] Deleted logs/optimal_params.json to prevent Bayesian override of manual settings")
+        except OSError:
+            # Can't delete — overwrite with empty params so _load_optimal_params() is a no-op
+            try:
+                with open(_opt_params_path, "w") as f:
+                    json.dump({"params": {}}, f)
+                print("  [CLEANUP] Cleared logs/optimal_params.json — manual config preserved")
+                logger.info("[STARTUP] Cleared optimal_params.json (delete failed, wrote empty params)")
+            except Exception as e:
+                print(f"  [CLEANUP] Could not clear optimal_params.json: {e}")
+                logger.warning(f"[STARTUP] Failed to clear optimal_params.json: {e}")
 
     print("  Starting bot v29...")
 
@@ -10218,9 +10331,9 @@ def main():
                     wallet.sell(coin, _fp)
                     _exited_this_cycle.add(coin)
                     record_exit(pos.get("strategy", "momentum"), coin, "long", entry, _fp, _current_regime, wallet=wallet)
-                    # Gap detection: if actual loss > 1.5x expected SL, trigger lockout
+                    # Gap detection: if actual loss > 1.2x expected SL, trigger lockout
                     _expected_sl = pos.get("entry_sl", sl_target)
-                    if abs(pnl_pct) > _expected_sl * 1.5:
+                    if abs(pnl_pct) > _expected_sl * 1.2:
                         logger.error(f"GAP EVENT LONG {coin}: lost {pnl_pct:+.2f}% vs expected -{_expected_sl:.2f}%")
                         adaptive_risk.force_gap_lockout(cycle, duration=100)
                         if kill_switch:
@@ -10521,9 +10634,9 @@ def main():
                     wallet.cover(coin, _fp)
                     _exited_this_cycle.add(coin)
                     record_exit(pos.get("strategy", "momentum"), coin, "short", entry, _fp, _current_regime, wallet=wallet)
-                    # Gap detection: if actual loss > 1.5x expected SL, trigger lockout
+                    # Gap detection: if actual loss > 1.2x expected SL, trigger lockout
                     _expected_sl = pos.get("entry_sl", sl_target)
-                    if abs(pnl_pct) > _expected_sl * 1.5:
+                    if abs(pnl_pct) > _expected_sl * 1.2:
                         logger.error(f"GAP EVENT SHORT {coin}: lost {pnl_pct:+.2f}% vs expected -{_expected_sl:.2f}%")
                         adaptive_risk.force_gap_lockout(cycle, duration=100)
                         if kill_switch:
@@ -11051,18 +11164,18 @@ def main():
             # Health score safety: size reduction + entry block based on _last_health_score
             _health_size_mult = 1.0
             _health_block = False
-            if _last_health_score < 20:
+            if _last_health_score < 30:
                 _health_size_mult = 0.5
                 if cycle % 10 == 0:
                     logger.warning(f"HEALTH LOW: score={_last_health_score} — 50% size")
-            elif _last_health_score < 30:
+            elif _last_health_score < 40:
                 _health_size_mult = 0.75
                 if cycle % 10 == 0:
                     logger.debug(f"HEALTH CAUTION: score={_last_health_score} — 75% size")
-            elif _last_health_score < 40:
-                _health_size_mult = 0.90
+            elif _last_health_score < 60:
+                _health_size_mult = 0.85
                 if cycle % 10 == 0:
-                    logger.debug(f"HEALTH WATCH: score={_last_health_score} — 90% size")
+                    logger.debug(f"HEALTH WATCH: score={_last_health_score} — 85% size")
             # Recovery mode: RELAX (not bypass) strategy health + overtrading + health block
             _in_recovery = recovery_mode.active
             if _in_recovery:
@@ -11216,14 +11329,13 @@ def main():
                             conviction_kill_tracker.record_override()
                         if _conv_active and _conv_tier == "HIGH_CONVICTION":
                             logger.info(f"OVERRIDE: High conviction trade allowed | {short_name} | score={r['score']:.2f}")
-                        # v29.4.0: restored conviction safety gate (uses runtime MIN_ATR_TO_TRADE)
+                        # v29.4.0: restored conviction safety gate (ATR removed — only momentum + micro_trend)
                         if _conv_active:
-                            _atr_ok = coin_atr(short_name) >= MIN_ATR_TO_TRADE
                             _mom_ok = momentum_confirmed(short_name, "long")[0]
                             _micro_ok = micro_trend_confirmed(short_name, "long")[0]
-                            if not (_atr_ok and _mom_ok and _micro_ok):
+                            if not (_mom_ok and _micro_ok):
                                 shadow.log_signal(short_name, "long", r["score"], "CONVICTION_UNSAFE", taken=False)
-                                logger.debug(f"CONVICTION_UNSAFE {short_name} long: atr={_atr_ok} mom={_mom_ok} micro={_micro_ok}")
+                                logger.debug(f"CONVICTION_UNSAFE {short_name} long: mom={_mom_ok} micro={_micro_ok}")
                                 market_brain.record_filter_block(cycle, "conviction_unsafe")
                                 continue
                         already_held = any(k in (coin_id, short_name, name) for k in wallet.longs)
@@ -11527,14 +11639,13 @@ def main():
                             conviction_kill_tracker.record_override()
                         if _conv_active and _conv_tier == "HIGH_CONVICTION":
                             logger.info(f"OVERRIDE: High conviction trade allowed | {short_name} | score={r['score']:.2f}")
-                        # v29.4.0: restored conviction safety gate (uses runtime MIN_ATR_TO_TRADE)
+                        # v29.4.0: restored conviction safety gate (ATR removed — only momentum + micro_trend)
                         if _conv_active:
-                            _atr_ok = coin_atr(short_name) >= MIN_ATR_TO_TRADE
                             _mom_ok = momentum_confirmed(short_name, "short")[0]
                             _micro_ok = micro_trend_confirmed(short_name, "short")[0]
-                            if not (_atr_ok and _mom_ok and _micro_ok):
+                            if not (_mom_ok and _micro_ok):
                                 shadow.log_signal(short_name, "short", r["score"], "CONVICTION_UNSAFE", taken=False)
-                                logger.debug(f"CONVICTION_UNSAFE {short_name} short: atr={_atr_ok} mom={_mom_ok} micro={_micro_ok}")
+                                logger.debug(f"CONVICTION_UNSAFE {short_name} short: mom={_mom_ok} micro={_micro_ok}")
                                 market_brain.record_filter_block(cycle, "conviction_unsafe")
                                 continue
                         already_held = any(k in (r["pair"], short_name, name) for k in wallet.longs)
@@ -11776,7 +11887,7 @@ def main():
                     mean_rev_allowed = False
                     # Shadow: log that regime blocked mean reversion
                     for pair, t in tickers.items():
-                        if t["vol"] >= 500000:
+                        if t["vol"] >= SCAN_PREFILTER_MIN_VOL:
                             coin = to_short_name(pair_names.get(pair, pair))
                             z = zscore(coin, lookback=50)
                             if z < -2.0:
@@ -11785,7 +11896,7 @@ def main():
                                 shadow.log_signal(coin, "short", z, "regime_no_meanrev", taken=False, strategy="mean_rev")
                 if mean_rev_allowed and regime in ("RANGING", "VOLATILE") and _usable_cash > 50:
                     for pair, t in tickers.items():
-                        if t["vol"] < 500000:
+                        if t["vol"] < SCAN_PREFILTER_MIN_VOL:
                             continue
                         name = pair_names.get(pair, pair)
                         coin = to_short_name(name)
@@ -12431,6 +12542,31 @@ def main():
                                     logger.debug(f"SIZE_TOO_SMALL {coin} short breakout ${amt:.2f} — skipped (min $5)")
                         elif squeeze_state == "BREAKOUT_DOWN" and len(wallet.shorts) >= 1:
                             shadow.log_signal(coin, "short", width, "position_limit", taken=False, strategy="breakout")
+
+            # ── v29.4.1: SMC/ICT STRATEGY — Liquidity Sweep + FVG + Order Block ──
+            if (not warmup_blocked and _api_ok and _usable_cash > 50
+                    and total_positions < _effective_max_positions and _heat_ok
+                    and _strategy_health_ok and _overtrading_ok and _kill_switch_ok
+                    and cascade_protection.allows_entry()):
+                for pair, t in tickers.items():
+                    name = pair_names.get(pair, pair)
+                    coin = to_short_name(name)
+                    if WHITELIST_ONLY and coin not in COIN_WHITELIST:
+                        continue
+                    if coin in DYNAMIC_BLACKLIST:
+                        continue
+                    if coin in wallet.longs or coin in wallet.shorts:
+                        continue
+                    hist = prices_cache.get(coin, [])
+                    if len(hist) < 50:
+                        continue
+                    smc_result = smc_ict_signal(coin, hist)
+                    if smc_result:
+                        direction, conf, entry, stop, tp = smc_result
+                        if direction == "long" and conf >= 6:
+                            logger.info(f"[SMC_ICT] {name} LONG score={conf}/10 entry={entry:.4f} stop={stop:.2f}% tp={tp:.2f}%")
+                            shadow.log_signal(coin, "long", conf, "smc_ict", taken=False, strategy="smc_ict")
+                            # TODO: wire into full entry logic (sizing, order execution) once strategy validated in paper
 
             # ── ADVANCED ALPHA ENTRIES ── v29.3.4
             # Runs 8 independent alpha strategies. Each generates signals with confidence scores.
