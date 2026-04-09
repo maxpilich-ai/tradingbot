@@ -36,7 +36,7 @@ DYNAMIC_BLACKLIST = {
 }
 
 # v29.4.1 — Coin Whitelist: only trade these 20 high-liquidity coins
-COIN_WHITELIST = {"XBT", "ETH", "SOL", "BTC"}  # v29.5.0: trimmed to 4 highest-liquidity coins
+COIN_WHITELIST = {"XBT", "ETH", "SOL", "LINK", "AVAX", "ADA", "LTC", "DOT"}  # v29.5.0: expanded to 8 high-liquidity coins
 WHITELIST_ONLY = True
 
 # v29.3.2 — Volatility circuit breaker: pause new entries when market vol > 5%
@@ -107,7 +107,7 @@ POLL = 2  # seconds (was 3 — faster signal checks, still within Kraken rate li
 MIN_VOL_USD = 500000  # Only trade coins with $500k+ daily volume
 PEAK_HOURS = (15, 21)  # UTC peak hours
 MAX_DAILY_TRADES = 60  # Was 30 — bot would trade for ~2 hours then sit dead for 22 hours
-MAX_POSITIONS = 2      # v29.5.0: was 8 — tight focus on 2 concurrent positions max
+MAX_POSITIONS = 4      # v29.5.0: was 2 — expanded to 4 for broader whitelist
 API_MAX_RETRIES = 3    # Retry failed API calls
 
 # ── Ranging Market Filter (toggleable) ──
@@ -9266,9 +9266,9 @@ def rank(tickers, min_vol=500000, regime=None):
         hist = prices_cache.get(coin_name, [])
         if len(hist) < 2:
             continue  # No price data — cannot compute any factors
-        _atr_val = coin_atr(coin_name) if callable(coin_atr) else 0.0
-        if _atr_val <= 0.0:
-            continue  # Zero ATR — dead or missing data
+        atr_val = coin_atr(coin_name)
+        if atr_val is None or atr_val <= 0.0:
+            continue  # Zero/None ATR — dead or missing data
         mom = t["change"]
         vol_score = min(1.0, math.log10(max(t["vol"], 1)) / 7)
 
