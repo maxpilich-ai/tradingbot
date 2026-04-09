@@ -36,7 +36,7 @@ DYNAMIC_BLACKLIST = {
 }
 
 # v29.4.1 — Coin Whitelist: only trade these 20 high-liquidity coins
-COIN_WHITELIST = {"BTC", "XBT", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "LINK", "DOT", "MATIC", "UNI", "ATOM", "NEAR", "APT", "SUI", "DOGE", "LTC", "ETC", "FIL"}
+COIN_WHITELIST = {"XBT", "ETH", "SOL", "BTC"}  # v29.5.0: trimmed to 4 highest-liquidity coins
 WHITELIST_ONLY = True
 
 # v29.3.2 — Volatility circuit breaker: pause new entries when market vol > 5%
@@ -73,6 +73,11 @@ SCAN_PREFILTER_ATR_RANGE = (0.0005, 0.015)        # ATR outside this range = ski
 
 kill_switch = None  # Initialized in main() with starting equity
 
+# ── v29.5.0: Pro Market Condition & Protection Runtime State ──
+_pro_peak_portfolio = 0.0             # Runtime: peak portfolio value for drawdown protection
+_pro_last_5_results = []              # Runtime: last 5 trade results ["win"/"loss"] for streak sizing
+_pro_market_regime = "UNKNOWN"        # Runtime: current market regime (TRENDING/RANGING/VOLATILE/DEAD)
+
 # ── Setup ──
 DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(os.path.join(DIR, "logs"), exist_ok=True)
@@ -102,7 +107,7 @@ POLL = 2  # seconds (was 3 — faster signal checks, still within Kraken rate li
 MIN_VOL_USD = 500000  # Only trade coins with $500k+ daily volume
 PEAK_HOURS = (15, 21)  # UTC peak hours
 MAX_DAILY_TRADES = 60  # Was 30 — bot would trade for ~2 hours then sit dead for 22 hours
-MAX_POSITIONS = 8      # Was 5 — filled all slots immediately, then nothing could enter. 8 gives room to cycle
+MAX_POSITIONS = 2      # v29.5.0: was 8 — tight focus on 2 concurrent positions max
 API_MAX_RETRIES = 3    # Retry failed API calls
 
 # ── Ranging Market Filter (toggleable) ──
@@ -150,7 +155,7 @@ GLOBAL_RISK_CAP_PCT = 12.0       # v29.3.5: was 3.0 — only allowed 2 of 8 slot
 GAP_RISK_MULTIPLIER = 1.2         # v29.4.0: 1.2x SL gap (was 1.5 — tighter gap for paper trading)
 MAX_PER_GROUP = 2                # Max positions per correlation group
 MAX_RISK_PER_TRADE = 0.015        # 1.5% of portfolio per trade (was 0.5% — positions too small to make meaningful returns)
-MAX_DAILY_LOSS_PCT = 10.0         # 10% daily loss hard stop — close ALL + halt
+MAX_DAILY_LOSS_PCT = 2.5          # v29.5.0: was 10% — tight 2.5% daily loss hard stop
 STRESS_RISK_LIMIT_PCT = 25.0      # v29.3.5: was 8.0 — 3x multiplier blocked after just 2 positions. 25% allows full deployment
 SLIPPAGE_BASE = 0.05              # Base slippage %
 SLIPPAGE_SL_EXIT = 0.10           # v29.3.5: paper trading — no need for panic slippage (was 0.3%)
@@ -4828,6 +4833,9 @@ def record_exit(strategy, coin, direction, entry_price, exit_price, regime_str="
         else:
             _loss_streak_count = 0  # reset on any win or break-even
 
+        # v29.5.0: Streak-based sizing tracking
+        record_trade_result(net_pnl > 0)
+
         # v29.3.4: Per-coin loss streak tracking + auto temp-blacklist
         if TEMP_BLACKLIST_ENABLED:
             if net_pnl < 0:
@@ -5727,6 +5735,9 @@ class Wallet:
             "loss_streak_count": _loss_streak_count,
             "loss_streak_paused_until": _loss_streak_paused_until,
             "session_peak_equity": _session_peak_equity,
+            # v29.5.0: Pro state persistence
+            "pro_peak_portfolio": _pro_peak_portfolio,
+            "pro_last_5_results": _pro_last_5_results[-10:],
             # Save self-awareness data
             "awareness": {
                 "long_wins": awareness.long_wins,
@@ -5834,6 +5845,10 @@ class Wallet:
                 _loss_streak_count = s.get("loss_streak_count", 0)
                 _loss_streak_paused_until = s.get("loss_streak_paused_until", 0)
                 _session_peak_equity = s.get("session_peak_equity", 0)
+                # v29.5.0: Restore pro state
+                global _pro_peak_portfolio, _pro_last_5_results
+                _pro_peak_portfolio = s.get("pro_peak_portfolio", 0)
+                _pro_last_5_results = s.get("pro_last_5_results", [])
                 # v29.4.0: Restore DexScanner + stock watchlist state
                 global stock_watchlist
                 try:
@@ -9839,6 +9854,565 @@ def smc_ict_signal(coin, prices):
         return None
 
 
+# ── v29.5.0: SMC Order Block Signal ──
+def smc_ob_signal(coin, prices, direction):
+    """
+    SMC Order Block Strategy: Find last opposite candle before strong impulse.
+    Returns {"score", "direction", "ob_high", "ob_low", "entry", "stop", "target"} or None.
+    Score 0-8: +2 OB zone holds, +2 aligns with trend, +2 volume 1.5x avg on impulse, +2 RSI at formation.
+    Trade if score >= 6. Stop = 0.3% beyond OB zone, target = 3.2x stop.
+    """
+    if len(prices) < 30:
+        return None
+    try:
+        recent = prices[-30:]
+        avg_move = sum(abs(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))) / (len(recent) - 1)
+        # Estimate volume proxy from price movement magnitude
+        moves = [abs(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
+        avg_vol_proxy = sum(moves) / len(moves) if moves else 0.001
+
+        if direction == "long":
+            # Find last bearish candle before bullish impulse in last 15 candles
+            ob_high = ob_low = None
+            impulse_found = False
+            for i in range(len(recent) - 2, 4, -1):
+                # Bullish impulse: price moved up > 2x avg move
+                impulse_move = (recent[i] - recent[i-1]) / recent[i-1] if recent[i-1] > 0 else 0
+                if impulse_move > avg_move * 2:
+                    # Look for bearish candle just before impulse
+                    for j in range(i - 1, max(0, i - 4), -1):
+                        pre_move = (recent[j] - recent[j-1]) / recent[j-1] if recent[j-1] > 0 else 0
+                        if pre_move < 0:  # Bearish candle
+                            ob_high = max(recent[j], recent[j-1])
+                            ob_low = min(recent[j], recent[j-1])
+                            impulse_found = True
+                            break
+                    if impulse_found:
+                        break
+            if not impulse_found or ob_high is None:
+                return None
+            # Price must be pulling back into OB zone
+            current = prices[-1]
+            if not (ob_low <= current <= ob_high * 1.002):
+                return None
+        elif direction == "short":
+            ob_high = ob_low = None
+            impulse_found = False
+            for i in range(len(recent) - 2, 4, -1):
+                impulse_move = (recent[i] - recent[i-1]) / recent[i-1] if recent[i-1] > 0 else 0
+                if impulse_move < -avg_move * 2:
+                    for j in range(i - 1, max(0, i - 4), -1):
+                        pre_move = (recent[j] - recent[j-1]) / recent[j-1] if recent[j-1] > 0 else 0
+                        if pre_move > 0:  # Bullish candle (OB for short)
+                            ob_high = max(recent[j], recent[j-1])
+                            ob_low = min(recent[j], recent[j-1])
+                            impulse_found = True
+                            break
+                    if impulse_found:
+                        break
+            if not impulse_found or ob_high is None:
+                return None
+            current = prices[-1]
+            if not (ob_low * 0.998 <= current <= ob_high):
+                return None
+        else:
+            return None
+
+        # Score: 0-8
+        score = 0
+        current = prices[-1]
+        # +2: OB zone holds (price bounced off it at least once in last 10 candles)
+        zone_touches = sum(1 for p in prices[-10:] if ob_low <= p <= ob_high)
+        if zone_touches >= 2:
+            score += 2
+        # +2: aligns with trend (EMA20 direction)
+        if len(prices) >= 20:
+            ema20 = sum(prices[-20:]) / 20
+            if direction == "long" and current > ema20:
+                score += 2
+            elif direction == "short" and current < ema20:
+                score += 2
+        # +2: volume 1.5x avg on impulse (use move magnitude as proxy)
+        if impulse_found and len(moves) > 1:
+            impulse_mag = max(moves[-5:]) if len(moves) >= 5 else moves[-1]
+            if impulse_mag > avg_vol_proxy * 1.5:
+                score += 2
+        # +2: RSI oversold/overbought at formation
+        if len(prices) >= 14:
+            _rsi_gains = []
+            _rsi_losses = []
+            for k in range(1, 15):
+                chg = prices[-k] - prices[-k-1]
+                if chg > 0:
+                    _rsi_gains.append(chg)
+                    _rsi_losses.append(0)
+                else:
+                    _rsi_gains.append(0)
+                    _rsi_losses.append(abs(chg))
+            avg_gain = sum(_rsi_gains) / 14
+            avg_loss = sum(_rsi_losses) / 14
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            else:
+                rsi = 100
+            if direction == "long" and rsi < 35:
+                score += 2
+            elif direction == "short" and rsi > 65:
+                score += 2
+
+        if score < 6:
+            return None
+
+        # Stop: 0.3% beyond OB zone
+        if direction == "long":
+            stop_dist = (current - ob_low) / current * 100 + 0.3
+        else:
+            stop_dist = (ob_high - current) / current * 100 + 0.3
+        stop_dist = max(0.5, min(stop_dist, 2.0))
+        target = stop_dist * 3.2
+
+        logger.info(f"[SMC_OB] {coin} {direction.upper()} score={score}/8 "
+                     f"ob=[{ob_low:.4f}-{ob_high:.4f}] stop={stop_dist:.2f}% tp={target:.2f}%")
+
+        return {"score": score, "direction": direction, "ob_high": ob_high, "ob_low": ob_low,
+                "entry": current, "stop": stop_dist, "target": target}
+    except Exception as e:
+        logger.debug(f"[SMC_OB] {coin} error: {e}")
+        return None
+
+
+# ── v29.5.0: SMC Holy Grail Signal (Sweep + OB + FVG) ──
+def smc_holy_grail_signal(coin, prices):
+    """
+    Requires ALL THREE: liquidity sweep + order block in sweep zone + FVG from impulse.
+    Score 0-10: +3 sweep present, +3 OB in sweep zone, +3 FVG exists, +1 all on same candle.
+    Trade ONLY if score >= 8 (highest confidence). Stop = 1% max, target = 3.5x stop.
+    """
+    if len(prices) < 50:
+        return None
+    try:
+        recent = prices[-50:]
+        current = prices[-1]
+
+        # Step 1: Liquidity sweep detection (same logic as smc_ict_signal)
+        swing_low = min(recent[-30:-5])
+        swing_high = max(recent[-30:-5])
+        prev5 = prices[-6:-1]
+
+        # Check for sweep below support
+        swept_low = any(p < swing_low * 0.997 for p in prev5)
+        # Check for sweep above resistance
+        swept_high = any(p > swing_high * 1.003 for p in prev5)
+
+        if not swept_low and not swept_high:
+            return None
+
+        score = 0
+        direction = "long" if swept_low else "short"
+
+        # +3: sweep present
+        if swept_low or swept_high:
+            score += 3
+
+        # Step 2: Order block in sweep zone
+        sweep_zone_low = min(prev5) if swept_low else swing_high
+        sweep_zone_high = swing_low if swept_low else max(prev5)
+        ob_found = False
+        avg_move = sum(abs(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))) / (len(recent) - 1)
+
+        for i in range(len(recent) - 2, 4, -1):
+            c_move = (recent[i] - recent[i-1]) / recent[i-1] if recent[i-1] > 0 else 0
+            if direction == "long" and c_move < 0:
+                c_high = max(recent[i], recent[i-1])
+                c_low = min(recent[i], recent[i-1])
+                if c_low >= sweep_zone_low * 0.995 and c_high <= sweep_zone_high * 1.005:
+                    ob_found = True
+                    break
+            elif direction == "short" and c_move > 0:
+                c_high = max(recent[i], recent[i-1])
+                c_low = min(recent[i], recent[i-1])
+                if c_low >= sweep_zone_low * 0.995 and c_high <= sweep_zone_high * 1.005:
+                    ob_found = True
+                    break
+
+        if ob_found:
+            score += 3
+
+        # Step 3: FVG from impulse
+        fvg_found = False
+        if len(prices) >= 5:
+            c1_low = prices[-5]
+            c3_high = prices[-3]
+            fvg_low = min(c1_low, c3_high)
+            fvg_high = max(c1_low, c3_high)
+            fvg_size = (fvg_high - fvg_low) / fvg_low if fvg_low > 0 else 0
+            if fvg_size >= 0.002:
+                fvg_found = True
+                score += 3
+
+        # +1: all conditions overlapping on same candle range
+        if ob_found and fvg_found:
+            score += 1
+
+        if score < 8:
+            return None
+
+        # Stop: 1% max
+        if direction == "long":
+            sweep_depth = (swing_low - min(prev5)) / swing_low * 100 if swing_low > 0 else 0.5
+            stop_pct = min(1.0, max(0.5, sweep_depth + 0.3))
+        else:
+            sweep_depth = (max(prev5) - swing_high) / swing_high * 100 if swing_high > 0 else 0.5
+            stop_pct = min(1.0, max(0.5, sweep_depth + 0.3))
+
+        target_pct = stop_pct * 3.5
+
+        logger.info(f"[SMC_HOLY_GRAIL] {coin} {direction.upper()} score={score}/10 "
+                     f"sweep={'LOW' if swept_low else 'HIGH'} ob={ob_found} fvg={fvg_found} "
+                     f"stop={stop_pct:.2f}% tp={target_pct:.2f}%")
+
+        return {"score": score, "direction": direction, "ob_high": sweep_zone_high, "ob_low": sweep_zone_low,
+                "entry": current, "stop": stop_pct, "target": target_pct}
+    except Exception as e:
+        logger.debug(f"[SMC_HOLY_GRAIL] {coin} error: {e}")
+        return None
+
+
+# ── v29.5.0: SMC Breakout + FVG Signal ──
+def smc_breakout_fvg_signal(coin, prices):
+    """
+    Step 1: price broke above 20-candle high or below 20-candle low.
+    Step 2: price pulled back but not more than 61.8% retrace.
+    Step 3: FVG exists in pullback zone.
+    Score 0-9: +2 clean breakout close, +2 clean pullback, +2 FVG present, +2 breakout volume 2x avg, +1 RSI crossed 50.
+    Trade if score >= 6. Stop = 0.5% below pullback low, target = 3.2x stop.
+    """
+    if len(prices) < 25:
+        return None
+    try:
+        lookback = prices[-25:]
+        range_prices = lookback[:-5]  # 20-candle range excluding last 5
+        if len(range_prices) < 20:
+            return None
+        range_high = max(range_prices)
+        range_low = min(range_prices)
+        recent5 = lookback[-5:]
+        current = prices[-1]
+
+        # Step 1: Breakout detection
+        broke_high = any(p > range_high * 1.001 for p in recent5)
+        broke_low = any(p < range_low * 0.999 for p in recent5)
+
+        if not broke_high and not broke_low:
+            return None
+
+        direction = "long" if broke_high else "short"
+
+        # Step 2: Pullback check (not more than 61.8% retrace)
+        if direction == "long":
+            breakout_peak = max(recent5)
+            retrace_pct = (breakout_peak - current) / (breakout_peak - range_high) if breakout_peak > range_high else 999
+            if retrace_pct > 0.618 or current < range_high:
+                return None
+            pullback_low = min(recent5[-3:])
+        else:
+            breakout_trough = min(recent5)
+            retrace_pct = (current - breakout_trough) / (range_low - breakout_trough) if range_low > breakout_trough else 999
+            if retrace_pct > 0.618 or current > range_low:
+                return None
+            pullback_high = max(recent5[-3:])
+
+        # Step 3: FVG in pullback zone
+        fvg_found = False
+        if len(prices) >= 5:
+            c1 = prices[-5]
+            c3 = prices[-3]
+            fvg_gap = abs(c1 - c3) / min(c1, c3) if min(c1, c3) > 0 else 0
+            if fvg_gap >= 0.002:
+                fvg_found = True
+
+        # Scoring
+        score = 0
+        # +2: clean breakout close (current still above/below range)
+        if direction == "long" and current > range_high:
+            score += 2
+        elif direction == "short" and current < range_low:
+            score += 2
+        # +2: clean pullback (orderly, not a crash)
+        if direction == "long" and 0 < retrace_pct < 0.5:
+            score += 2
+        elif direction == "short" and 0 < retrace_pct < 0.5:
+            score += 2
+        # +2: FVG present
+        if fvg_found:
+            score += 2
+        # +2: breakout volume 2x avg (using price move magnitude as proxy)
+        moves = [abs(lookback[i] - lookback[i-1]) / lookback[i-1] for i in range(1, len(lookback)) if lookback[i-1] > 0]
+        avg_move = sum(moves) / len(moves) if moves else 0.001
+        breakout_moves = [abs(recent5[i] - recent5[i-1]) / recent5[i-1] for i in range(1, len(recent5)) if recent5[i-1] > 0]
+        max_breakout_move = max(breakout_moves) if breakout_moves else 0
+        if max_breakout_move > avg_move * 2:
+            score += 2
+        # +1: RSI crossed 50
+        if len(prices) >= 14:
+            gains = []
+            losses = []
+            for k in range(1, 15):
+                chg = prices[-k] - prices[-k-1]
+                gains.append(max(0, chg))
+                losses.append(max(0, -chg))
+            avg_g = sum(gains) / 14
+            avg_l = sum(losses) / 14
+            rsi = 100 - (100 / (1 + avg_g / avg_l)) if avg_l > 0 else 100
+            if direction == "long" and rsi > 50:
+                score += 1
+            elif direction == "short" and rsi < 50:
+                score += 1
+
+        if score < 6:
+            return None
+
+        # Stop and target
+        if direction == "long":
+            stop_pct = max(0.5, (current - pullback_low) / current * 100 + 0.5)
+        else:
+            stop_pct = max(0.5, (pullback_high - current) / current * 100 + 0.5)
+        stop_pct = min(stop_pct, 2.0)
+        target_pct = stop_pct * 3.2
+
+        logger.info(f"[SMC_BREAKOUT] {coin} {direction.upper()} score={score}/9 "
+                     f"retrace={retrace_pct:.2f} fvg={fvg_found} stop={stop_pct:.2f}% tp={target_pct:.2f}%")
+
+        return {"score": score, "direction": direction,
+                "ob_high": range_high, "ob_low": range_low,
+                "entry": current, "stop": stop_pct, "target": target_pct}
+    except Exception as e:
+        logger.debug(f"[SMC_BREAKOUT] {coin} error: {e}")
+        return None
+
+
+# ── v29.5.0: SMC Valid Zone Filter ──
+def smc_valid_zone(coin, price, prices):
+    """
+    Universal SMC filter: Returns False if price is in middle third of 20-candle range.
+    Only trade near tops/bottoms of range or at key levels.
+    """
+    if len(prices) < 20:
+        return True  # Not enough data, allow
+    try:
+        recent20 = prices[-20:]
+        hi = max(recent20)
+        lo = min(recent20)
+        if hi <= lo:
+            return True  # Flat market, allow
+        rng = hi - lo
+        lower_third = lo + rng * 0.333
+        upper_third = lo + rng * 0.667
+        # In middle third → not a valid zone
+        if lower_third < price < upper_third:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+# ── v29.5.0: Market Regime Detection ──
+def detect_market_regime(btc_prices):
+    """
+    Detect current market regime from BTC price history.
+    TRENDING: BTC moved >1.5% in last 20 candles
+    RANGING: BTC moved <0.5% in last 20 candles
+    VOLATILE: ATR >2%
+    DEAD: ATR <0.1%
+    Returns string: "TRENDING", "RANGING", "VOLATILE", "DEAD"
+    """
+    if len(btc_prices) < 20:
+        return "UNKNOWN"
+    try:
+        recent = btc_prices[-20:]
+        net_move = abs(recent[-1] - recent[0]) / recent[0] if recent[0] > 0 else 0
+        # ATR as average of absolute moves
+        moves = [abs(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent)) if recent[i-1] > 0]
+        atr_pct = (sum(moves) / len(moves) * 100) if moves else 0
+
+        if atr_pct < 0.1:
+            return "DEAD"
+        if atr_pct > 2.0:
+            return "VOLATILE"
+        if net_move * 100 > 1.5:
+            return "TRENDING"
+        if net_move * 100 < 0.5:
+            return "RANGING"
+        return "TRENDING"  # Default to trending if between 0.5-1.5%
+    except Exception:
+        return "UNKNOWN"
+
+
+# ── v29.5.0: Volatility-Scaled Position Sizing Multiplier ──
+def volatility_size_mult(coin):
+    """
+    Scale position size based on current ATR:
+    ATR < 0.3%: 0.5x | ATR 0.3-0.8%: 1.0x | ATR 0.8-1.5%: 0.75x | ATR > 1.5%: 0.4x
+    """
+    try:
+        atr = coin_atr(coin) * 100  # Convert to percentage
+        if atr < 0.3:
+            return 0.5
+        elif atr <= 0.8:
+            return 1.0
+        elif atr <= 1.5:
+            return 0.75
+        else:
+            return 0.4
+    except Exception:
+        return 1.0
+
+
+# ── v29.5.0: Adaptive TP/SL based on ATR ──
+def adaptive_tp_ratio(coin):
+    """
+    ATR < 0.5%: TP = 4.0x SL
+    ATR 0.5-1.0%: TP = 3.2x SL (current default)
+    ATR > 1.0%: TP = 2.5x SL
+    """
+    try:
+        atr = coin_atr(coin) * 100
+        if atr < 0.5:
+            return 4.0
+        elif atr <= 1.0:
+            return 3.2
+        else:
+            return 2.5
+    except Exception:
+        return 3.2
+
+
+# ── v29.5.0: Trend Strength (0-10) ──
+def get_trend_strength(prices, direction="long"):
+    """
+    Returns trend strength 0-10:
+    +3 if EMA20 > EMA50 (long) or EMA20 < EMA50 (short)
+    +2 if price above/below 20-candle VWAP
+    +3 if higher highs + higher lows pattern (last 5 candles)
+    +2 if volume on last candle > 1.5x average
+    """
+    if len(prices) < 50:
+        return 0
+    try:
+        strength = 0
+        current = prices[-1]
+
+        # EMA20 vs EMA50
+        ema20 = sum(prices[-20:]) / 20
+        ema50 = sum(prices[-50:]) / 50
+        if direction == "long" and ema20 > ema50:
+            strength += 3
+        elif direction == "short" and ema20 < ema50:
+            strength += 3
+
+        # Price vs 20-candle VWAP (approximated as simple average since we don't have volume)
+        vwap20 = sum(prices[-20:]) / 20
+        if direction == "long" and current > vwap20:
+            strength += 2
+        elif direction == "short" and current < vwap20:
+            strength += 2
+
+        # Higher highs + higher lows (or lower lows + lower highs for short)
+        last5 = prices[-5:]
+        if direction == "long":
+            hh = all(last5[i] >= last5[i-1] * 0.999 for i in range(1, len(last5)))
+            hl = min(last5[1:]) >= min(last5[:-1]) * 0.999
+            if hh and hl:
+                strength += 3
+        else:
+            ll = all(last5[i] <= last5[i-1] * 1.001 for i in range(1, len(last5)))
+            lh = max(last5[1:]) <= max(last5[:-1]) * 1.001
+            if ll and lh:
+                strength += 3
+
+        # Volume proxy: last candle move > 1.5x average
+        moves = [abs(prices[-i] - prices[-i-1]) / prices[-i-1] for i in range(1, min(21, len(prices))) if prices[-i-1] > 0]
+        if moves:
+            last_move = moves[0]
+            avg_move = sum(moves) / len(moves)
+            if last_move > avg_move * 1.5:
+                strength += 2
+
+        return strength
+    except Exception:
+        return 0
+
+
+# ── v29.5.0: Active Session Filter ──
+def is_active_session():
+    """
+    Trading session size multiplier:
+    14:00-22:00 UTC → 1.0 (full size)
+    08:00-14:00 UTC → 0.75
+    22:00-08:00 UTC → 0.5 (and require score >= 8 for any entry)
+    Returns (size_mult, min_score_override)
+    """
+    try:
+        utc_hour = datetime.now(timezone.utc).hour
+        if 14 <= utc_hour < 22:
+            return (1.0, None)  # Full session, no score override
+        elif 8 <= utc_hour < 14:
+            return (0.75, None)
+        else:
+            return (0.5, 8)  # Off-hours: 50% size, require score >= 8
+    except Exception:
+        return (1.0, None)
+
+
+# ── v29.5.0: Drawdown Protection ──
+def drawdown_protection_mult(equity):
+    """
+    Track peak portfolio value. Returns (size_mult, allow_entry):
+    >5% drawdown from peak → 0.5x size
+    >10% drawdown from peak → block all entries
+    >15% → existing kill switch handles it
+    """
+    global _pro_peak_portfolio
+    if equity > _pro_peak_portfolio:
+        _pro_peak_portfolio = equity
+    if _pro_peak_portfolio <= 0:
+        return (1.0, True)
+    dd_pct = (_pro_peak_portfolio - equity) / _pro_peak_portfolio * 100
+    if dd_pct > 10:
+        return (0.0, False)  # Block all entries
+    elif dd_pct > 5:
+        return (0.5, True)  # Half size
+    return (1.0, True)
+
+
+# ── v29.5.0: Streak-Based Sizing ──
+def streak_size_mult():
+    """
+    Track last 5 results. Returns sizing multiplier:
+    5 wins → 1.2x (max)
+    3 consecutive losses → 0.7x
+    """
+    global _pro_last_5_results
+    if len(_pro_last_5_results) < 3:
+        return 1.0
+    last5 = _pro_last_5_results[-5:] if len(_pro_last_5_results) >= 5 else _pro_last_5_results
+    last3 = _pro_last_5_results[-3:]
+    if len(last5) >= 5 and all(r == "win" for r in last5):
+        return 1.2
+    if all(r == "loss" for r in last3):
+        return 0.7
+    return 1.0
+
+
+def record_trade_result(won):
+    """Record a win/loss for streak tracking."""
+    global _pro_last_5_results
+    _pro_last_5_results.append("win" if won else "loss")
+    if len(_pro_last_5_results) > 10:
+        _pro_last_5_results = _pro_last_5_results[-10:]
+
+
 # ── Main ──
 def main():
     if "--reset" in sys.argv:
@@ -11205,6 +11779,29 @@ def main():
             if cycle % 50 == 0 and FEAR_GREED_ENABLED:
                 logger.info(f"[F&G] cycle={cycle} index={_fear_greed_value} ({_fear_greed_label}) size_mult={_fg_size_mult:.2f} dca_mult={_dca_size_mult:.2f}")
 
+            # ── v29.5.0: Pro Market Condition Logic ──
+            global _pro_market_regime, _pro_peak_portfolio
+            # Regime detection from BTC prices
+            _btc_hist = prices_cache.get("BTC", prices_cache.get("XBT", []))
+            _pro_market_regime = detect_market_regime(_btc_hist)
+            if cycle % 50 == 0:
+                logger.info(f"[REGIME] cycle={cycle} regime={_pro_market_regime}")
+            if _pro_market_regime == "DEAD" and cycle % 10 == 0:
+                logger.info(f"[REGIME_SKIP] cycle={cycle} dead market — all entries blocked")
+
+            # Session-aware sizing
+            _session_mult, _session_min_score = is_active_session()
+
+            # Drawdown protection
+            _pv = wallet.value(prices) if hasattr(wallet, 'value') else wallet.cash
+            _dd_mult, _dd_allow_entry = drawdown_protection_mult(_pv)
+            if not _dd_allow_entry:
+                if cycle % 10 == 0:
+                    logger.warning(f"[DD_PROTECT] Drawdown >{10}% from peak (${_pro_peak_portfolio:.0f} → ${_pv:.0f}) — blocking new entries")
+
+            # Streak-based sizing
+            _streak_mult = streak_size_mult()
+
             # v29.4.0: BTC Market Condition Gate — pause momentum/breakout when BTC is ranging
             _btc_condition, _btc_move = btc_market_condition()
             _btc_ranging = (_btc_condition == "RANGING")
@@ -11249,7 +11846,7 @@ def main():
                             logger.info(f"[MEANREV] SHORT {_mr_coin} ${_mr_amt:.0f} @ ${_mr_price:.4f} z={_mr_z:+.2f} | BTC ranging")
 
             # v29.4.0: BTC TRENDING → normal momentum/breakout/alpha entries
-            elif not _btc_ranging and not warmup_blocked and _api_ok and not _api_stale_block and not _health_block and last_full_rank and _usable_cash > 50 and perf.can_trade(cycle) and total_positions < _effective_max_positions and cascade_protection.allows_entry() and _strategy_health_ok and _overtrading_ok and _kill_switch_ok and not _error_cooldown and not _overtrade_cooldown_active and _heat_ok:
+            elif not _btc_ranging and not warmup_blocked and _api_ok and not _api_stale_block and not _health_block and last_full_rank and _usable_cash > 50 and perf.can_trade(cycle) and total_positions < _effective_max_positions and cascade_protection.allows_entry() and _strategy_health_ok and _overtrading_ok and _kill_switch_ok and not _error_cooldown and not _overtrade_cooldown_active and _heat_ok and _pro_market_regime != "DEAD" and _dd_allow_entry:
                 _dead_market_skips = 0  # v29.2: count dead-market pair skips this cycle
                 if (DEBUG_MODE or is_verbose("DEBUG")) and cycle % 10 == 0:
                     _total_risk = calculate_total_risk(wallet, prices) if (wallet.longs or wallet.shorts) else 0
@@ -11316,6 +11913,12 @@ def main():
                             logger.info(f"[REJECTED: TREND_WEAK] {_l_coin_name} LONG score={r['score']:.2f} chg={r['change']:.4f} agree={_mt_agree}/{_mt_total}")
                             shadow.log_signal(_l_coin_name, "long", r["score"], "trend_weak", taken=False)
                             market_brain.record_filter_block(cycle, "trend_weak")
+                            continue
+                        # v29.5.0: Trend strength filter for momentum entries (require >= 5)
+                        _l_hist = prices_cache.get(_l_coin_name, [])
+                        _l_ts = get_trend_strength(_l_hist, "long")
+                        if _l_ts < 5:
+                            shadow.log_signal(_l_coin_name, "long", r["score"], "low_trend_strength", taken=False)
                             continue
                         if _usable_cash < 100:
                             break
@@ -11500,6 +12103,11 @@ def main():
                         amount *= _choppy_size_mult  # CHOPPY regime: 70% size, else 1.0
                         amount *= _sideways_size_mult  # Sideways market: scale down proportionally
                         amount *= _trend_size_boost  # +10% in strong trends (clean_trends≥75%, not CHOPPY)
+                        # v29.5.0: Pro multipliers
+                        amount *= volatility_size_mult(short_name)  # ATR-based sizing
+                        amount *= _session_mult  # Session-aware sizing
+                        amount *= _dd_mult  # Drawdown protection
+                        amount *= _streak_mult  # Streak-based sizing
                         # Multiplier stacking floor: never reduce below 25% of risk-capped size
                         if _amt_before_mults > 0 and amount < _amt_before_mults * 0.25:
                             amount = _amt_before_mults * 0.25
@@ -11798,6 +12406,11 @@ def main():
                         amount *= _choppy_size_mult  # CHOPPY regime: 70% size, else 1.0
                         amount *= _sideways_size_mult  # Sideways market: scale down proportionally
                         amount *= _trend_size_boost  # +10% in strong trends (clean_trends≥75%, not CHOPPY)
+                        # v29.5.0: Pro multipliers
+                        amount *= volatility_size_mult(short_name)
+                        amount *= _session_mult
+                        amount *= _dd_mult
+                        amount *= _streak_mult
                         # Multiplier stacking floor: never reduce below 25% of risk-capped size
                         if _amt_before_mults > 0 and amount < _amt_before_mults * 0.25:
                             amount = _amt_before_mults * 0.25
@@ -12547,7 +13160,8 @@ def main():
             if (not warmup_blocked and _api_ok and _usable_cash > 50
                     and total_positions < _effective_max_positions and _heat_ok
                     and _strategy_health_ok and _overtrading_ok and _kill_switch_ok
-                    and cascade_protection.allows_entry()):
+                    and cascade_protection.allows_entry()
+                    and _pro_market_regime != "DEAD" and _dd_allow_entry):
                 for pair, t in tickers.items():
                     name = pair_names.get(pair, pair)
                     coin = to_short_name(name)
@@ -12594,6 +13208,11 @@ def main():
                             _smc_amt *= _fg_size_mult
                             _smc_amt *= _dca_size_mult
                             _smc_amt *= _choppy_size_mult
+                            # v29.5.0: Pro multipliers
+                            _smc_amt *= volatility_size_mult(coin)
+                            _smc_amt *= _session_mult
+                            _smc_amt *= _dd_mult
+                            _smc_amt *= _streak_mult
                             # Multiplier floor
                             if _smc_amt_before > 0 and _smc_amt < _smc_amt_before * 0.25:
                                 _smc_amt = _smc_amt_before * 0.25
@@ -12638,6 +13257,192 @@ def main():
                                     pair_failure_tracker.record_failure(coin, cycle)
                             else:
                                 logger.debug(f"SIZE_TOO_SMALL {coin} smc_ict ${_smc_amt:.2f} — skipped (min $5)")
+
+            # ── v29.5.0: THREE NEW SMC STRATEGIES — OB / Holy Grail / Breakout+FVG ──
+            # Regime filter: DEAD → skip ALL, VOLATILE → 50% size + 30% tighter stops
+            # Session filter: off-hours require score >= 8
+            # Drawdown filter: >10% DD → block entries
+            if (not warmup_blocked and _api_ok and _usable_cash > 50
+                    and total_positions < _effective_max_positions and _heat_ok
+                    and _strategy_health_ok and _overtrading_ok and _kill_switch_ok
+                    and cascade_protection.allows_entry()
+                    and _pro_market_regime != "DEAD" and _dd_allow_entry):
+                for pair, t in tickers.items():
+                    name = pair_names.get(pair, pair)
+                    coin = to_short_name(name)
+                    if WHITELIST_ONLY and coin not in COIN_WHITELIST:
+                        continue
+                    if coin in DYNAMIC_BLACKLIST:
+                        continue
+                    if coin in wallet.longs or coin in wallet.shorts:
+                        continue
+                    hist = prices_cache.get(coin, [])
+                    if len(hist) < 50:
+                        continue
+                    # Zone filter: skip if price in middle third of range
+                    if not smc_valid_zone(coin, t["price"], hist):
+                        continue
+
+                    # ── Regime-based strategy selection ──
+                    _regime_vol_mult = 0.5 if _pro_market_regime == "VOLATILE" else 1.0
+                    _regime_stop_mult = 0.7 if _pro_market_regime == "VOLATILE" else 1.0  # 30% tighter stops
+
+                    # ── SMC Order Block ──
+                    for _ob_dir in ("long", "short"):
+                        # Regime filter: OB is ranging strategy
+                        if _pro_market_regime == "TRENDING" and _ob_dir == "long":
+                            continue  # In trending, prefer breakout/momentum over OB
+                        ob_result = smc_ob_signal(coin, hist, _ob_dir)
+                        if ob_result and ob_result["score"] >= 6:
+                            _ob_score = ob_result["score"]
+                            # Session filter
+                            if _session_min_score and _ob_score < _session_min_score:
+                                continue
+                            # Trend strength filter for momentum/breakout
+                            # (OB is mean-reversion, skip trend filter)
+                            if not group_limit_ok(coin, wallet):
+                                continue
+                            if not liquidity_ok(coin):
+                                continue
+                            # Sizing
+                            _ob_sl = ob_result["stop"] * _regime_stop_mult
+                            _ob_tp = ob_result["target"]
+                            _ob_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
+                            _ob_eff_sl = _ob_sl * GAP_RISK_MULTIPLIER
+                            _ob_max_by_risk = _ob_max_risk / (_ob_eff_sl / 100) if _ob_eff_sl > 0 else 50
+                            _ob_max_by_risk = min(_ob_max_by_risk, wallet.value(prices) * 0.30)
+                            _ob_base = kelly_size(wallet, min(wallet.cash * 0.30, _ob_max_by_risk), prices)
+                            _ob_amt = _ob_base * _edge_size_multiplier()
+                            _ob_amt = min(_ob_amt, _ob_max_by_risk)
+                            _ob_amt *= size_mult * _health_size_mult * _fg_size_mult * _dca_size_mult * _choppy_size_mult
+                            _ob_amt *= volatility_size_mult(coin) * _session_mult * _dd_mult * _streak_mult * _regime_vol_mult
+                            _ob_amt = max(_ob_amt, _ob_max_by_risk * 0.25) if _ob_max_by_risk >= 15 else _ob_amt  # floor
+                            _ob_amt = min(_ob_amt, _ob_max_by_risk)
+                            if _ob_amt < 5:
+                                continue
+                            _ob_exp_ok, _ = unified_exposure_ok(wallet, prices, coin, _ob_amt, _ob_sl)
+                            if not _ob_exp_ok:
+                                continue
+                            _ob_side = "BUY" if _ob_dir == "long" else "SHORT"
+                            order = executor.place_order(_ob_side, coin, t["price"], _ob_amt, wallet, prices)
+                            if order["filled"]:
+                                _pos_dict = wallet.longs if _ob_dir == "long" else wallet.shorts
+                                if coin in _pos_dict:
+                                    _pos_dict[coin]["strategy"] = "smc_ob"
+                                    _pos_dict[coin]["bought_cycle"] = cycle
+                                    _pos_dict[coin]["entry_sl"] = _ob_sl
+                                    _pos_dict[coin]["entry_atr"] = coin_atr(coin) * 100
+                                    shadow.log_signal(coin, _ob_dir, _ob_score, "smc_ob", taken=True, strategy="smc_ob")
+                                    overtrading_guard.record_trade(cycle)
+                                    market_brain.record_entry(cycle)
+                                    recovery_mode.record_trade(cycle)
+                                    min_activity.record_trade(cycle)
+                                    logger.info(f"[SMC_OB_ENTRY] {_ob_side} {coin} ${_ob_amt:.0f} score={_ob_score}/8 sl={_ob_sl:.2f}% tp={_ob_tp:.2f}%")
+                                    log_trade_entry(coin, _ob_dir, "smc_ob", _ob_amt, order['fill_price'], _ob_sl, coin_atr(coin)*100, _edge_size_multiplier(), _current_regime, cycle)
+                                    break
+                            elif not order["filled"]:
+                                pair_failure_tracker.record_failure(coin, cycle)
+                    else:
+                        # Didn't break from OB loop — continue to next strategies
+                        pass
+
+                    # ── SMC Holy Grail (Sweep + OB + FVG) ──
+                    hg_result = smc_holy_grail_signal(coin, hist)
+                    if hg_result and hg_result["score"] >= 8:
+                        _hg_score = hg_result["score"]
+                        _hg_dir = hg_result["direction"]
+                        if _session_min_score and _hg_score < _session_min_score:
+                            pass  # Skip but don't break — check breakout next
+                        elif not group_limit_ok(coin, wallet) or not liquidity_ok(coin):
+                            pass
+                        else:
+                            _hg_sl = hg_result["stop"] * _regime_stop_mult
+                            _hg_tp = hg_result["target"]
+                            _hg_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
+                            _hg_eff_sl = _hg_sl * GAP_RISK_MULTIPLIER
+                            _hg_max_by_risk = _hg_max_risk / (_hg_eff_sl / 100) if _hg_eff_sl > 0 else 50
+                            _hg_max_by_risk = min(_hg_max_by_risk, wallet.value(prices) * 0.30)
+                            _hg_base = kelly_size(wallet, min(wallet.cash * 0.30, _hg_max_by_risk), prices)
+                            _hg_amt = _hg_base * _edge_size_multiplier()
+                            _hg_amt = min(_hg_amt, _hg_max_by_risk)
+                            _hg_amt *= size_mult * _health_size_mult * _fg_size_mult * _dca_size_mult * _choppy_size_mult
+                            _hg_amt *= volatility_size_mult(coin) * _session_mult * _dd_mult * _streak_mult * _regime_vol_mult
+                            _hg_amt = max(_hg_amt, _hg_max_by_risk * 0.25) if _hg_max_by_risk >= 15 else _hg_amt
+                            _hg_amt = min(_hg_amt, _hg_max_by_risk)
+                            if _hg_amt >= 5:
+                                _hg_exp_ok, _ = unified_exposure_ok(wallet, prices, coin, _hg_amt, _hg_sl)
+                                if _hg_exp_ok:
+                                    _hg_side = "BUY" if _hg_dir == "long" else "SHORT"
+                                    order = executor.place_order(_hg_side, coin, t["price"], _hg_amt, wallet, prices)
+                                    if order["filled"]:
+                                        _pos_dict = wallet.longs if _hg_dir == "long" else wallet.shorts
+                                        if coin in _pos_dict:
+                                            _pos_dict[coin]["strategy"] = "smc_holy_grail"
+                                            _pos_dict[coin]["bought_cycle"] = cycle
+                                            _pos_dict[coin]["entry_sl"] = _hg_sl
+                                            _pos_dict[coin]["entry_atr"] = coin_atr(coin) * 100
+                                            shadow.log_signal(coin, _hg_dir, _hg_score, "smc_holy_grail", taken=True, strategy="smc_holy_grail")
+                                            overtrading_guard.record_trade(cycle)
+                                            market_brain.record_entry(cycle)
+                                            recovery_mode.record_trade(cycle)
+                                            min_activity.record_trade(cycle)
+                                            logger.info(f"[SMC_HOLY_GRAIL_ENTRY] {_hg_side} {coin} ${_hg_amt:.0f} score={_hg_score}/10 sl={_hg_sl:.2f}% tp={_hg_tp:.2f}%")
+                                            log_trade_entry(coin, _hg_dir, "smc_holy_grail", _hg_amt, order['fill_price'], _hg_sl, coin_atr(coin)*100, _edge_size_multiplier(), _current_regime, cycle)
+                                            continue  # Next coin
+                                    elif not order["filled"]:
+                                        pair_failure_tracker.record_failure(coin, cycle)
+
+                    # ── SMC Breakout + FVG ──
+                    # Regime filter: breakout is a trending strategy
+                    if _pro_market_regime in ("TRENDING", "VOLATILE", "UNKNOWN"):
+                        bk_result = smc_breakout_fvg_signal(coin, hist)
+                        if bk_result and bk_result["score"] >= 6:
+                            _bk_score = bk_result["score"]
+                            _bk_dir = bk_result["direction"]
+                            if _session_min_score and _bk_score < _session_min_score:
+                                pass
+                            elif not group_limit_ok(coin, wallet) or not liquidity_ok(coin):
+                                pass
+                            else:
+                                # Trend strength filter for breakout
+                                _ts = get_trend_strength(hist, _bk_dir)
+                                if _ts < 5:
+                                    shadow.log_signal(coin, _bk_dir, _bk_score, "smc_breakout_weak_trend", taken=False, strategy="smc_breakout")
+                                else:
+                                    _bk_sl = bk_result["stop"] * _regime_stop_mult
+                                    _bk_tp = bk_result["target"]
+                                    _bk_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
+                                    _bk_eff_sl = _bk_sl * GAP_RISK_MULTIPLIER
+                                    _bk_max_by_risk = _bk_max_risk / (_bk_eff_sl / 100) if _bk_eff_sl > 0 else 50
+                                    _bk_max_by_risk = min(_bk_max_by_risk, wallet.value(prices) * 0.30)
+                                    _bk_base = kelly_size(wallet, min(wallet.cash * 0.30, _bk_max_by_risk), prices)
+                                    _bk_amt = _bk_base * _edge_size_multiplier()
+                                    _bk_amt = min(_bk_amt, _bk_max_by_risk)
+                                    _bk_amt *= size_mult * _health_size_mult * _fg_size_mult * _dca_size_mult * _choppy_size_mult
+                                    _bk_amt *= volatility_size_mult(coin) * _session_mult * _dd_mult * _streak_mult * _regime_vol_mult
+                                    _bk_amt = max(_bk_amt, _bk_max_by_risk * 0.25) if _bk_max_by_risk >= 15 else _bk_amt
+                                    _bk_amt = min(_bk_amt, _bk_max_by_risk)
+                                    if _bk_amt >= 5:
+                                        _bk_exp_ok, _ = unified_exposure_ok(wallet, prices, coin, _bk_amt, _bk_sl)
+                                        if _bk_exp_ok:
+                                            _bk_side_str = "BUY" if _bk_dir == "long" else "SHORT"
+                                            order = executor.place_order(_bk_side_str, coin, t["price"], _bk_amt, wallet, prices)
+                                            if order["filled"]:
+                                                _pos_dict = wallet.longs if _bk_dir == "long" else wallet.shorts
+                                                if coin in _pos_dict:
+                                                    _pos_dict[coin]["strategy"] = "smc_breakout"
+                                                    _pos_dict[coin]["bought_cycle"] = cycle
+                                                    _pos_dict[coin]["entry_sl"] = _bk_sl
+                                                    _pos_dict[coin]["entry_atr"] = coin_atr(coin) * 100
+                                                    shadow.log_signal(coin, _bk_dir, _bk_score, "smc_breakout", taken=True, strategy="smc_breakout")
+                                                    overtrading_guard.record_trade(cycle)
+                                                    market_brain.record_entry(cycle)
+                                                    recovery_mode.record_trade(cycle)
+                                                    min_activity.record_trade(cycle)
+                                                    logger.info(f"[SMC_BREAKOUT_ENTRY] {_bk_side_str} {coin} ${_bk_amt:.0f} score={_bk_score}/9 trend={_ts}/10 sl={_bk_sl:.2f}% tp={_bk_tp:.2f}%")
+                                                    log_trade_entry(coin, _bk_dir, "smc_breakout", _bk_amt, order['fill_price'], _bk_sl, coin_atr(coin)*100, _edge_size_multiplier(), _current_regime, cycle)
+                                            elif not order["filled"]:
+                                                pair_failure_tracker.record_failure(coin, cycle)
 
             # ── ADVANCED ALPHA ENTRIES ── v29.3.4
             # Runs 8 independent alpha strategies. Each generates signals with confidence scores.
@@ -13383,7 +14188,9 @@ def run_backtest(days=30, starting_cash=1000.0, verbose=True):
             atr = coin_atr(coin)
             atr_pct = max(0.01, atr * 100)
             sl_target = max(SL_BASE_PCT, atr_pct * ATR_SL_MULTIPLIER)
-            tp_ratio = TP_RATIO_TRENDING if _current_regime in ("SMOOTH_TREND", "VOLATILE_TREND") else TP_RATIO_NORMAL
+            tp_ratio = adaptive_tp_ratio(coin)  # v29.5.0: ATR-adaptive TP ratio
+            if _current_regime in ("SMOOTH_TREND", "VOLATILE_TREND") and TP_RATIO_TRENDING > tp_ratio:
+                tp_ratio = TP_RATIO_TRENDING  # Use trending ratio if higher
             tp_trigger = sl_target * tp_ratio
 
             _final_tm = pos.get("_trail_tm", 1.0)
@@ -13453,7 +14260,9 @@ def run_backtest(days=30, starting_cash=1000.0, verbose=True):
             atr = coin_atr(coin)
             atr_pct = max(0.01, atr * 100)
             sl_target = max(SL_BASE_PCT, atr_pct * ATR_SL_MULTIPLIER)
-            tp_ratio = TP_RATIO_TRENDING if _current_regime in ("SMOOTH_TREND", "VOLATILE_TREND") else TP_RATIO_NORMAL
+            tp_ratio = adaptive_tp_ratio(coin)  # v29.5.0: ATR-adaptive TP ratio
+            if _current_regime in ("SMOOTH_TREND", "VOLATILE_TREND") and TP_RATIO_TRENDING > tp_ratio:
+                tp_ratio = TP_RATIO_TRENDING  # Use trending ratio if higher
             tp_trigger = sl_target * tp_ratio
 
             _final_tm = pos.get("_trail_tm", 1.0)
