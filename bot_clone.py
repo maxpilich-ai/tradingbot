@@ -9261,6 +9261,14 @@ def rank(tickers, min_vol=500000, regime=None):
     for pair, t in tickers.items():
         if t["vol"] < min_vol:
             continue
+        # v29.5.0: Skip coins with no price history or zero ATR (no data to trade on)
+        coin_name = to_short_name(pair) if callable(to_short_name) else pair
+        hist = prices_cache.get(coin_name, [])
+        if len(hist) < 2:
+            continue  # No price data — cannot compute any factors
+        _atr_val = coin_atr(coin_name) if callable(coin_atr) else 0.0
+        if _atr_val <= 0.0:
+            continue  # Zero ATR — dead or missing data
         mom = t["change"]
         vol_score = min(1.0, math.log10(max(t["vol"], 1)) / 7)
 
@@ -9270,8 +9278,6 @@ def rank(tickers, min_vol=500000, regime=None):
 
         # Factor 2: RSI-14 divergence
         f_rsi = 0.0
-        coin_name = to_short_name(pair) if callable(to_short_name) else pair
-        hist = prices_cache.get(coin_name, [])
         if len(hist) >= 16:
             gains, losses = [], []
             for i in range(max(1, len(hist) - 14), len(hist)):
@@ -9715,12 +9721,12 @@ def preflight_sizing_report(wallet_ref, prices_ref, ranked_list, pair_names_map,
                     tp_s = 0.85  # v29.3
                 else:
                     tp_s = 1.0   # v29.3
-                tp = max(0.4, sl_pct * 1.1 * tp_s)  # v29.3.2-S9: TP 1.2x→1.1x per S9 validation
+                tp_pct = max(0.4, sl_pct * TP_RATIO_NORMAL)  # v29.5.0: use config constant instead of hardcoded 1.1
                 trail = max(0.5, atr_pct * 0.5)  # v29.3: tighter trail
 
                 flag = "OK" if 10 <= sized <= 150 else "LOW" if sized < 10 else "HIGH"
                 print(f"    {i+1}. {coin:12s} score={r['score']:+.3f} chg={r['change']:+.1%} vol=${r['vol']/1e6:.1f}M")
-                print(f"       size=${sized:.0f} [{flag}] SL={sl_pct:.1f}% TP={tp:.1f}% trail={trail:.1f}% ATR={atr_pct:.1f}%")
+                print(f"       size=${sized:.0f} [{flag}] SL={sl_pct:.1f}% TP={tp_pct:.1f}% trail={trail:.1f}% ATR={atr_pct:.1f}%")
 
         # Bottom 5 short candidates
         bot5 = ranked_list[-5:] if len(ranked_list) >= 5 else []
@@ -11905,6 +11911,11 @@ def main():
                             logger.debug(f"[FILTER_TRACE] {to_short_name(pair_names.get(r['pair'], r['pair']))} LONG score={r['score']:.2f} BLOCKED=low_volume ({r['vol']:.0f})")
                             market_brain.record_filter_block(cycle, "low_volume")
                             continue
+                        # v29.5.0: MIN_MOMENTUM_SCORE moved up — cheap filter before expensive checks
+                        if abs(r["score"]) < MIN_MOMENTUM_SCORE:
+                            logger.debug(f"[BLOCKED: WEAK_MOMENTUM] {to_short_name(pair_names.get(r['pair'], r['pair']))} LONG — score {r['score']:.3f} < {MIN_MOMENTUM_SCORE}")
+                            shadow.log_signal(to_short_name(pair_names.get(r['pair'], r['pair'])), "long", r["score"], "weak_momentum", taken=False)
+                            continue
                         # v29.3.5: noise filter removed (redundant — MIN_MOMENTUM_SCORE=0.08 > NOISE_MOM_MIN_SCORE=0.01)
                         # ── v29.3 ENTRY QUALITY: Momentum Confirmation (LONG) ──
                         _l_coin_name = to_short_name(pair_names.get(r['pair'], r['pair']))
@@ -11971,11 +11982,7 @@ def main():
                         if cycle < _loss_streak_paused_until:
                             logger.info(f"[PAUSED: LOSS_STREAK_PROTECTION] {short_name} LONG — paused until cycle {_loss_streak_paused_until} (streak={_loss_streak_count})")
                             continue
-                        # v29.3.3: Minimum momentum filter — require abs(score) >= 0.15
-                        if abs(r["score"]) < MIN_MOMENTUM_SCORE:
-                            logger.debug(f"[BLOCKED: WEAK_MOMENTUM] {short_name} LONG — score {r['score']:.3f} < {MIN_MOMENTUM_SCORE}")
-                            shadow.log_signal(short_name, "long", r["score"], "weak_momentum", taken=False)
-                            continue
+                        # v29.5.0: MIN_MOMENTUM_SCORE check moved earlier (before expensive filters)
                         # v29.3.5: Split cooldown — winners 15 cycles, losers 40 cycles
                         if short_name in _last_exit_cycle:
                             _cd_cycle, _cd_was_win = _last_exit_cycle[short_name]
@@ -12228,6 +12235,11 @@ def main():
                                 logger.debug(f"[FILTER_TRACE] {to_short_name(pair_names.get(r['pair'], r['pair']))} SHORT score={r['score']:.2f} chg={r['change']:.4f} vol={r['vol']:.0f} BLOCKED=threshold (min_s={min_short_score:.3f} min_c={min_short_change:.4f})")
                             market_brain.record_filter_block(cycle, "score_threshold")
                             continue
+                        # v29.5.0: MIN_MOMENTUM_SCORE moved up — cheap filter before expensive checks
+                        if abs(r["score"]) < MIN_MOMENTUM_SCORE:
+                            logger.debug(f"[BLOCKED: WEAK_MOMENTUM] {to_short_name(pair_names.get(r['pair'], r['pair']))} SHORT — score {r['score']:.3f} < {MIN_MOMENTUM_SCORE}")
+                            shadow.log_signal(to_short_name(pair_names.get(r['pair'], r['pair'])), "short", r["score"], "weak_momentum", taken=False)
+                            continue
                         # v29.3.5: noise filter removed (redundant — MIN_MOMENTUM_SCORE=0.08 > NOISE_SHORT_MIN_SCORE=0.01)
                         # ── v29.3 ENTRY QUALITY: Momentum Confirmation (SHORT) ──
                         _s_coin_name = to_short_name(pair_names.get(r['pair'], r['pair']))
@@ -12286,11 +12298,7 @@ def main():
                         if cycle < _loss_streak_paused_until:
                             logger.info(f"[PAUSED: LOSS_STREAK_PROTECTION] {short_name} SHORT — paused until cycle {_loss_streak_paused_until}")
                             continue
-                        # v29.3.3: Minimum momentum filter
-                        if abs(r["score"]) < MIN_MOMENTUM_SCORE:
-                            logger.debug(f"[BLOCKED: WEAK_MOMENTUM] {short_name} SHORT — score {r['score']:.3f} < {MIN_MOMENTUM_SCORE}")
-                            shadow.log_signal(short_name, "short", r["score"], "weak_momentum", taken=False)
-                            continue
+                        # v29.5.0: MIN_MOMENTUM_SCORE check moved earlier (before expensive filters)
                         # v29.3.5: Split cooldown — winners 15 cycles, losers 40 cycles
                         if short_name in _last_exit_cycle:
                             _cd_cycle, _cd_was_win = _last_exit_cycle[short_name]
