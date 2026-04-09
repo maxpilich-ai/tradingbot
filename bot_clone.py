@@ -12562,11 +12562,82 @@ def main():
                         continue
                     smc_result = smc_ict_signal(coin, hist)
                     if smc_result:
-                        direction, conf, entry, stop, tp = smc_result
+                        direction, conf, smc_entry, smc_stop, smc_tp = smc_result
                         if direction == "long" and conf >= 6:
-                            logger.info(f"[SMC_ICT] {name} LONG score={conf}/10 entry={entry:.4f} stop={stop:.2f}% tp={tp:.2f}%")
-                            shadow.log_signal(coin, "long", conf, "smc_ict", taken=False, strategy="smc_ict")
-                            # TODO: wire into full entry logic (sizing, order execution) once strategy validated in paper
+                            logger.info(f"[SMC_ICT] {coin} LONG score={conf}/10 entry={smc_entry:.4f} stop={smc_stop:.2f}% tp={smc_tp:.2f}%")
+                            # Safety gates (same as momentum longs)
+                            if not group_limit_ok(coin, wallet):
+                                shadow.log_signal(coin, "long", conf, "smc_ict_group_limit", taken=False, strategy="smc_ict")
+                                continue
+                            if not liquidity_ok(coin):
+                                shadow.log_signal(coin, "long", conf, "smc_ict_low_liquidity", taken=False, strategy="smc_ict")
+                                continue
+                            if not volatility_spike_check(coin):
+                                shadow.log_signal(coin, "long", conf, "smc_ict_vol_spike", taken=False, strategy="smc_ict")
+                                continue
+                            if coin in _suspicious_coins:
+                                shadow.log_signal(coin, "long", conf, "smc_ict_suspicious", taken=False, strategy="smc_ict")
+                                continue
+                            # Sizing: Kelly + risk cap (mirrors momentum long sizing)
+                            _smc_atr = coin_atr(coin) * 100
+                            _smc_sl = max(0.8, min(smc_stop, 1.5))  # Use SMC stop, floor 0.8%, cap 1.5%
+                            _smc_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
+                            _smc_eff_sl = _smc_sl * GAP_RISK_MULTIPLIER
+                            _smc_max_by_risk = _smc_max_risk / (_smc_eff_sl / 100)
+                            _smc_max_by_risk = min(_smc_max_by_risk, wallet.value(prices) * 0.30)
+                            _smc_base = kelly_size(wallet, min(wallet.cash * 0.30, _smc_max_by_risk), prices)
+                            _smc_amt = _smc_base * _edge_size_multiplier()
+                            _smc_amt = min(_smc_amt, _smc_max_by_risk)
+                            _smc_amt_before = _smc_amt
+                            _smc_amt *= size_mult
+                            _smc_amt *= _health_size_mult
+                            _smc_amt *= _fg_size_mult
+                            _smc_amt *= _dca_size_mult
+                            _smc_amt *= _choppy_size_mult
+                            # Multiplier floor
+                            if _smc_amt_before > 0 and _smc_amt < _smc_amt_before * 0.25:
+                                _smc_amt = _smc_amt_before * 0.25
+                                logger.debug(f"[MULT_FLOOR] {coin} SMC_ICT: floored to 25% of {_smc_amt_before:.2f}")
+                            # Score boost: high-conviction SMC setups
+                            if conf >= 9:
+                                _smc_amt *= 1.25
+                                logger.debug(f"[SIG_BOOST] {coin} SMC_ICT: elite score ({conf}/10) +25%")
+                            elif conf >= 7:
+                                _smc_amt *= 1.15
+                                logger.debug(f"[SIG_BOOST] {coin} SMC_ICT: strong score ({conf}/10) +15%")
+                            _smc_amt = min(_smc_amt, wallet.value(prices) * 0.30)
+                            _smc_amt = min(_smc_amt, _smc_max_by_risk)
+                            if _smc_amt < 15 and _smc_amt > 0 and _smc_max_by_risk >= 15:
+                                _smc_amt = 15
+                            # Exposure check
+                            _smc_exp_ok, _smc_exp_reason = unified_exposure_ok(wallet, prices, coin, _smc_amt, _smc_sl)
+                            if not _smc_exp_ok:
+                                shadow.log_signal(coin, "long", conf, f"smc_ict_{_smc_exp_reason}", taken=False, strategy="smc_ict")
+                                continue
+                            if not market_depth_ok(coin, _smc_amt, tickers):
+                                shadow.log_signal(coin, "long", conf, "smc_ict_thin_market", taken=False, strategy="smc_ict")
+                                continue
+                            # Execute
+                            if _smc_amt > 5:
+                                order = executor.place_order("BUY", coin, t["price"], _smc_amt, wallet, prices)
+                                if order["filled"] and coin in wallet.longs:
+                                    wallet.longs[coin]["strategy"] = "smc_ict"
+                                    wallet.longs[coin]["bought_cycle"] = cycle
+                                    wallet.longs[coin]["entry_sl"] = _smc_sl
+                                    wallet.longs[coin]["entry_atr"] = _smc_atr
+                                    shadow.log_signal(coin, "long", conf, "smc_ict", taken=True, strategy="smc_ict")
+                                    overtrading_guard.record_trade(cycle)
+                                    market_brain.record_entry(cycle)
+                                    recovery_mode.record_trade(cycle)
+                                    min_activity.record_trade(cycle)
+                                    logger.info(f"[SMC_ICT_ENTRY] BUY {coin} ${_smc_amt:.0f} score={conf}/10 sl={_smc_sl:.2f}% tp={smc_tp:.2f}% slip={order['slippage_pct']:.3f}%")
+                                    log_trade_entry(coin, "long", "smc_ict", _smc_amt, order['fill_price'], _smc_sl, _smc_atr, _edge_size_multiplier(), _current_regime, cycle)
+                                    break
+                                elif not order["filled"]:
+                                    shadow.log_signal(coin, "long", conf, f"smc_ict_rejected:{order['reject_reason']}", taken=False, strategy="smc_ict")
+                                    pair_failure_tracker.record_failure(coin, cycle)
+                            else:
+                                logger.debug(f"SIZE_TOO_SMALL {coin} smc_ict ${_smc_amt:.2f} — skipped (min $5)")
 
             # ── ADVANCED ALPHA ENTRIES ── v29.3.4
             # Runs 8 independent alpha strategies. Each generates signals with confidence scores.
