@@ -150,7 +150,7 @@ DECISION_SAFE_MODE = True         # True = reduce size aggressively instead of b
 PAPER_MODE = True                 # True = paper trading (wallet only), False = Kraken API (future)
 SIMULATED_SLIPPAGE_PCT = 0.05    # 0.05% adverse slippage on every fill
 MAX_SPREAD_PCT = 0.20            # v29.4.1: tightened — whitelist coins all have tight spreads (was 0.60%)
-MIN_ORDER_USD = 5                # Minimum order size in USD (lowered for paper trading)
+MIN_ORDER_USD = 10               # Minimum order size in USD (match POSITION_SIZE_FLOOR_USD)
 GLOBAL_RISK_CAP_PCT = 12.0       # v29.3.5: was 3.0 — only allowed 2 of 8 slots. 12% = 8 × 1.5% risk per trade
 GAP_RISK_MULTIPLIER = 1.2         # v29.4.0: 1.2x SL gap (was 1.5 — tighter gap for paper trading)
 MAX_PER_GROUP = 2                # Max positions per correlation group
@@ -243,7 +243,7 @@ SCORE_CHANGE_MIN_SHORT = -0.001   # Maximum price change for short momentum entr
 
 # ── Debug Mode ──
 DEBUG_MODE = False                 # True = verbose live trade/rejection/risk printing
-DRY_RUN_CYCLES = 50                # v29.3.4: 50 cycle observation window before paper trading begins
+DRY_RUN_CYCLES = 0                 # v29.3.4: disabled — warmup handles this already
 FRESH_SESSION = False              # False = resume previous session state on restart
 # ── Verbosity Level ──
 # "QUIET"  = errors only, no dashboard, no info prints
@@ -10891,7 +10891,7 @@ def main():
                     _tp_scale = 0.85  # v29.3: Volatile: tighter (was 0.9)
                 else:
                     _tp_scale = 1.0   # v29.3: Normal: no stretch (was 1.2)
-                _tp_base_ratio = 1.8 if (_clean_trends >= 75 and _current_regime != "CHOPPY") else 1.6  # v29.3.5: was 1.3/1.2 — raised for positive expectancy after slippage
+                _tp_base_ratio = TP_RATIO_TRENDING if (_clean_trends >= 75 and _current_regime != "CHOPPY") else TP_RATIO_NORMAL  # v29.3.5: use config constants instead of hardcoded 1.8/1.6
                 tp_trigger = max(0.4, sl_target * _tp_base_ratio * _tp_scale)  # v29.3: floor 0.4% (was 0.8%)
                 # Trend-strength TP boost: minimal push in strong trends
                 _trend_str = abs(short_momentum(coin, window=10))
@@ -11196,7 +11196,7 @@ def main():
                     _tp_scale = 0.85  # v29.3: Volatile: tighter (was 0.9)
                 else:
                     _tp_scale = 1.0   # v29.3: Normal: no stretch (was 1.2)
-                _tp_base_ratio = 1.8 if (_clean_trends >= 75 and _current_regime != "CHOPPY") else 1.6  # v29.3.5: was 1.3/1.2 — raised for positive expectancy after slippage
+                _tp_base_ratio = TP_RATIO_TRENDING if (_clean_trends >= 75 and _current_regime != "CHOPPY") else TP_RATIO_NORMAL  # v29.3.5: use config constants instead of hardcoded 1.8/1.6
                 tp_trigger = max(0.4, sl_target * _tp_base_ratio * _tp_scale)  # v29.3: floor 0.4% (was 0.8%)
                 # Trend-strength TP boost: minimal push in strong trends
                 _trend_str = abs(short_momentum(coin, window=10))
