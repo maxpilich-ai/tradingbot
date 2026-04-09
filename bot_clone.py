@@ -6420,6 +6420,7 @@ def to_short_name(name):
         n = n[1:]
     # XBT -> BTC
     n = n.replace("XBT", "BTC")
+    if n == "BT": n = "BTC"  # v29.5.0: catch XXBTZUSD → XX→BT via wsname path
     return n
 
 
@@ -13453,180 +13454,185 @@ def main():
                     and total_positions < _effective_max_positions and cascade_protection.allows_entry()
                     and _strategy_health_ok and _overtrading_ok and _kill_switch_ok
                     and not _error_cooldown and not _overtrade_cooldown_active and _heat_ok):
-                _alpha_taken = 0
-                _alpha_max_per_cycle = 2  # Max 2 alpha entries per cycle to avoid overtrading
-                _alpha_position_count = len(wallet.longs) + len(wallet.shorts)
-                _alpha_max_positions = int(_effective_max_positions * ALPHA_MAX_POSITIONS_PCT)
+                # v29.5.0: Skip entire alpha block if all 8 thresholds are at 1.0 (disabled)
+                _all_disabled = all(v >= 1.0 for v in ALPHA_STRATEGY_THRESHOLDS.values())
+                if _all_disabled:
+                    pass  # All alpha strategies disabled — skip silently
+                else:
+                    _alpha_taken = 0
+                    _alpha_max_per_cycle = 2  # Max 2 alpha entries per cycle to avoid overtrading
+                    _alpha_position_count = len(wallet.longs) + len(wallet.shorts)
+                    _alpha_max_positions = int(_effective_max_positions * ALPHA_MAX_POSITIONS_PCT)
 
-                # Collect all alpha signals from all strategies
-                _alpha_signals = []  # list of (coin, direction, confidence, strategy_name)
+                    # Collect all alpha signals from all strategies
+                    _alpha_signals = []  # list of (coin, direction, confidence, strategy_name)
 
-                # 1. PricePrediction — per-coin
-                for _ac in list(prices_cache.keys()):
-                    _pp_conf, _pp_dir = alpha_price_prediction.predict(_ac, cycle)
-                    if _pp_conf >= _alpha_threshold("price-prediction") and _pp_dir:
-                        _alpha_signals.append((_ac, _pp_dir, _pp_conf, "price-prediction"))
+                    # 1. PricePrediction — per-coin
+                    for _ac in list(prices_cache.keys()):
+                        _pp_conf, _pp_dir = alpha_price_prediction.predict(_ac, cycle)
+                        if _pp_conf >= _alpha_threshold("price-prediction") and _pp_dir:
+                            _alpha_signals.append((_ac, _pp_dir, _pp_conf, "price-prediction"))
 
-                # 2. QuantMultiStrategy — per-coin (6-model voting)
-                for _ac in list(prices_cache.keys()):
-                    _qm_conf, _qm_dir = alpha_quant.evaluate(_ac, cycle)
-                    if _qm_conf >= _alpha_threshold("quant-multi") and _qm_dir:
-                        _alpha_signals.append((_ac, _qm_dir, _qm_conf, "quant-multi"))
+                    # 2. QuantMultiStrategy — per-coin (6-model voting)
+                    for _ac in list(prices_cache.keys()):
+                        _qm_conf, _qm_dir = alpha_quant.evaluate(_ac, cycle)
+                        if _qm_conf >= _alpha_threshold("quant-multi") and _qm_dir:
+                            _alpha_signals.append((_ac, _qm_dir, _qm_conf, "quant-multi"))
 
-                # 3. GammaScalping — per-coin (round-number pin)
-                for _ac in list(prices_cache.keys()):
-                    _gs_conf, _gs_dir = alpha_gamma.scan(_ac, cycle)
-                    if _gs_conf >= _alpha_threshold("gamma-scalping") and _gs_dir:
-                        _alpha_signals.append((_ac, _gs_dir, _gs_conf, "gamma-scalping"))
+                    # 3. GammaScalping — per-coin (round-number pin)
+                    for _ac in list(prices_cache.keys()):
+                        _gs_conf, _gs_dir = alpha_gamma.scan(_ac, cycle)
+                        if _gs_conf >= _alpha_threshold("gamma-scalping") and _gs_dir:
+                            _alpha_signals.append((_ac, _gs_dir, _gs_conf, "gamma-scalping"))
 
-                # 4. MEVExtraction — batch scan
-                _mev_sigs = alpha_mev.scan(cycle, tickers or {})
-                for _mc, _md, _mconf in _mev_sigs:
-                    if _mconf >= _alpha_threshold("mev-extraction"):
-                        _alpha_signals.append((_mc, _md, _mconf, "mev-extraction"))
+                    # 4. MEVExtraction — batch scan
+                    _mev_sigs = alpha_mev.scan(cycle, tickers or {})
+                    for _mc, _md, _mconf in _mev_sigs:
+                        if _mconf >= _alpha_threshold("mev-extraction"):
+                            _alpha_signals.append((_mc, _md, _mconf, "mev-extraction"))
 
-                # 5. PairsTrading — batch scan
-                _pt_sigs = alpha_pairs.scan(cycle)
-                for _pc, _pd, _pconf in _pt_sigs:
-                    if _pconf >= _alpha_threshold("pairs-trading"):
-                        _alpha_signals.append((_pc, _pd, _pconf, "pairs-trading"))
+                    # 5. PairsTrading — batch scan
+                    _pt_sigs = alpha_pairs.scan(cycle)
+                    for _pc, _pd, _pconf in _pt_sigs:
+                        if _pconf >= _alpha_threshold("pairs-trading"):
+                            _alpha_signals.append((_pc, _pd, _pconf, "pairs-trading"))
 
-                # 6. EventDriven — batch scan (returns 4-tuples)
-                _ed_sigs = alpha_events.scan(cycle, tickers or {})
-                for _item in _ed_sigs:
-                    _ec, _edir, _econf = _item[0], _item[1], _item[2]
-                    _etype = _item[3] if len(_item) > 3 else "event"
-                    if _econf >= _alpha_threshold(f"event-{_etype}"):
-                        _alpha_signals.append((_ec, _edir, _econf, f"event-{_etype}"))
+                    # 6. EventDriven — batch scan (returns 4-tuples)
+                    _ed_sigs = alpha_events.scan(cycle, tickers or {})
+                    for _item in _ed_sigs:
+                        _ec, _edir, _econf = _item[0], _item[1], _item[2]
+                        _etype = _item[3] if len(_item) > 3 else "event"
+                        if _econf >= _alpha_threshold(f"event-{_etype}"):
+                            _alpha_signals.append((_ec, _edir, _econf, f"event-{_etype}"))
 
-                # 7. DiscretionaryMacro — directional bias (not per-coin, applies as filter boost)
-                _macro_dir, _macro_conf = alpha_macro.get_bias()
+                    # 7. DiscretionaryMacro — directional bias (not per-coin, applies as filter boost)
+                    _macro_dir, _macro_conf = alpha_macro.get_bias()
 
-                # 8. VixVolatilityTrading — vol regime bias
-                _vix_dir, _vix_conf = alpha_vix.favor_direction()
+                    # 8. VixVolatilityTrading — vol regime bias
+                    _vix_dir, _vix_conf = alpha_vix.favor_direction()
 
-                # Sort by confidence descending — best signals first
-                _alpha_signals.sort(key=lambda x: x[2], reverse=True)
+                    # Sort by confidence descending — best signals first
+                    _alpha_signals.sort(key=lambda x: x[2], reverse=True)
 
-                # Log alpha signal count (throttled)
-                if _alpha_signals and cycle % 10 == 0:
-                    logger.info(f"[ALPHA] cycle={cycle} raw_signals={len(_alpha_signals)} macro={alpha_macro.regime} vix={alpha_vix.vol_regime}")
+                    # Log alpha signal count (throttled)
+                    if _alpha_signals and cycle % 10 == 0:
+                        logger.info(f"[ALPHA] cycle={cycle} raw_signals={len(_alpha_signals)} macro={alpha_macro.regime} vix={alpha_vix.vol_regime}")
 
-                for _a_coin, _a_dir, _a_conf, _a_strat in _alpha_signals:
-                    if _alpha_taken >= _alpha_max_per_cycle:
-                        break
-                    if _alpha_position_count >= _effective_max_positions:
-                        break
-                    # Count alpha positions vs cap
-                    _alpha_held = sum(1 for p in wallet.longs.values() if p.get("strategy", "").startswith("alpha_"))
-                    _alpha_held += sum(1 for p in wallet.shorts.values() if p.get("strategy", "").startswith("alpha_"))
-                    if _alpha_held >= _alpha_max_positions:
-                        break
+                    for _a_coin, _a_dir, _a_conf, _a_strat in _alpha_signals:
+                        if _alpha_taken >= _alpha_max_per_cycle:
+                            break
+                        if _alpha_position_count >= _effective_max_positions:
+                            break
+                        # Count alpha positions vs cap
+                        _alpha_held = sum(1 for p in wallet.longs.values() if p.get("strategy", "").startswith("alpha_"))
+                        _alpha_held += sum(1 for p in wallet.shorts.values() if p.get("strategy", "").startswith("alpha_"))
+                        if _alpha_held >= _alpha_max_positions:
+                            break
 
-                    # ── SAFETY GATES (same as core strategies) ──
-                    # Skip if already holding this coin
-                    if _a_coin in wallet.longs or _a_coin in wallet.shorts:
-                        continue
-                    # Skip if in cooldown (v29.3.5: split — winners 15, losers 40)
-                    if _a_coin in _last_exit_cycle:
-                        _acd_cycle, _acd_was_win = _last_exit_cycle[_a_coin]
-                        _acd_limit = COOLDOWN_AFTER_WIN if _acd_was_win else COOLDOWN_AFTER_LOSS
-                        if (cycle - _acd_cycle) < _acd_limit:
+                        # ── SAFETY GATES (same as core strategies) ──
+                        # Skip if already holding this coin
+                        if _a_coin in wallet.longs or _a_coin in wallet.shorts:
                             continue
-                    # Static blacklist
-                    if _a_coin in DYNAMIC_BLACKLIST:
-                        continue
-                    # Temp blacklist
-                    if TEMP_BLACKLIST_ENABLED and dynamic_blacklist.is_blocked(_a_coin, cycle):
-                        continue
-                    # Coin loss tracker
-                    if coin_loss_tracker.is_blocked(_a_coin, cycle, is_ranging=_is_ranging):
-                        continue
-                    # Pair failure tracker
-                    if pair_failure_tracker.is_blocked(_a_coin, cycle, is_ranging=_is_ranging):
-                        continue
-                    # Group limit
-                    if not group_limit_ok(_a_coin, wallet):
-                        continue
-                    # ATR floor check
-                    _a_atr = coin_atr(_a_coin)
-                    if _a_atr < MIN_ATR_TO_TRADE:
-                        continue
-                    # Dead market check
-                    _a_hist = prices_cache.get(_a_coin, [])
-                    if len(_a_hist) < 10:
-                        continue
-                    _a_price = _a_hist[-1]
-                    if _a_price <= 0:
-                        continue
-                    # Volatility spike check
-                    if not volatility_spike_check(_a_coin):
-                        continue
-                    # Market depth check
-                    if not market_depth_ok(_a_coin, 50, tickers or {}):
-                        continue
-                    # Macro regime boost/penalty
-                    if _macro_dir and _macro_dir != _a_dir and _macro_conf >= 0.60:
-                        _a_conf *= 0.80  # Penalize against-macro trades
-                    if _macro_dir and _macro_dir == _a_dir:
-                        _a_conf = min(1.0, _a_conf * 1.10)  # Boost with-macro trades
-                    # Re-check after adjustment (per-strategy threshold)
-                    if _a_conf < _alpha_threshold(_a_strat):
-                        continue
+                        # Skip if in cooldown (v29.3.5: split — winners 15, losers 40)
+                        if _a_coin in _last_exit_cycle:
+                            _acd_cycle, _acd_was_win = _last_exit_cycle[_a_coin]
+                            _acd_limit = COOLDOWN_AFTER_WIN if _acd_was_win else COOLDOWN_AFTER_LOSS
+                            if (cycle - _acd_cycle) < _acd_limit:
+                                continue
+                        # Static blacklist
+                        if _a_coin in DYNAMIC_BLACKLIST:
+                            continue
+                        # Temp blacklist
+                        if TEMP_BLACKLIST_ENABLED and dynamic_blacklist.is_blocked(_a_coin, cycle):
+                            continue
+                        # Coin loss tracker
+                        if coin_loss_tracker.is_blocked(_a_coin, cycle, is_ranging=_is_ranging):
+                            continue
+                        # Pair failure tracker
+                        if pair_failure_tracker.is_blocked(_a_coin, cycle, is_ranging=_is_ranging):
+                            continue
+                        # Group limit
+                        if not group_limit_ok(_a_coin, wallet):
+                            continue
+                        # ATR floor check
+                        _a_atr = coin_atr(_a_coin)
+                        if _a_atr < MIN_ATR_TO_TRADE:
+                            continue
+                        # Dead market check
+                        _a_hist = prices_cache.get(_a_coin, [])
+                        if len(_a_hist) < 10:
+                            continue
+                        _a_price = _a_hist[-1]
+                        if _a_price <= 0:
+                            continue
+                        # Volatility spike check
+                        if not volatility_spike_check(_a_coin):
+                            continue
+                        # Market depth check
+                        if not market_depth_ok(_a_coin, 50, tickers or {}):
+                            continue
+                        # Macro regime boost/penalty
+                        if _macro_dir and _macro_dir != _a_dir and _macro_conf >= 0.60:
+                            _a_conf *= 0.80  # Penalize against-macro trades
+                        if _macro_dir and _macro_dir == _a_dir:
+                            _a_conf = min(1.0, _a_conf * 1.10)  # Boost with-macro trades
+                        # Re-check after adjustment (per-strategy threshold)
+                        if _a_conf < _alpha_threshold(_a_strat):
+                            continue
 
-                    # ── POSITION SIZING ──
-                    _a_atr_pct = _a_atr * 100
-                    _a_sl = max(0.8, _a_atr_pct * 0.7)
-                    _a_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
-                    _a_eff_sl = _a_sl * GAP_RISK_MULTIPLIER
-                    _a_max_by_risk = _a_max_risk / (_a_eff_sl / 100)
-                    _a_max_by_risk = min(_a_max_by_risk, wallet.value(prices) * 0.30)
-                    _a_amt = kelly_size(wallet, min(_usable_cash * 0.15, _a_max_by_risk), prices)
-                    _a_amt *= ALPHA_SIZE_MULT  # Conservative alpha sizing (0.70)
-                    _a_amt *= _edge_size_multiplier()
-                    _a_amt = _regime_size_scale(_a_amt, _current_regime)
-                    _a_amt *= size_mult  # off-peak × adaptive × warmup ramp
-                    _a_amt *= _health_size_mult
-                    _a_amt *= _brain.get("size_mult", 1.0)
-                    _a_amt *= alpha_vix.size_adjustment()  # Vol regime sizing
-                    _a_amt *= alpha_macro.size_multiplier()  # Macro regime sizing
-                    _a_amt = min(_a_amt, _a_max_by_risk)
-                    _a_amt = min(_a_amt, wallet.value(prices) * 0.20)  # 20% hard cap for alpha
+                        # ── POSITION SIZING ──
+                        _a_atr_pct = _a_atr * 100
+                        _a_sl = max(0.8, _a_atr_pct * 0.7)
+                        _a_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
+                        _a_eff_sl = _a_sl * GAP_RISK_MULTIPLIER
+                        _a_max_by_risk = _a_max_risk / (_a_eff_sl / 100)
+                        _a_max_by_risk = min(_a_max_by_risk, wallet.value(prices) * 0.30)
+                        _a_amt = kelly_size(wallet, min(_usable_cash * 0.15, _a_max_by_risk), prices)
+                        _a_amt *= ALPHA_SIZE_MULT  # Conservative alpha sizing (0.70)
+                        _a_amt *= _edge_size_multiplier()
+                        _a_amt = _regime_size_scale(_a_amt, _current_regime)
+                        _a_amt *= size_mult  # off-peak × adaptive × warmup ramp
+                        _a_amt *= _health_size_mult
+                        _a_amt *= _brain.get("size_mult", 1.0)
+                        _a_amt *= alpha_vix.size_adjustment()  # Vol regime sizing
+                        _a_amt *= alpha_macro.size_multiplier()  # Macro regime sizing
+                        _a_amt = min(_a_amt, _a_max_by_risk)
+                        _a_amt = min(_a_amt, wallet.value(prices) * 0.20)  # 20% hard cap for alpha
 
-                    if _a_amt < 5:
-                        logger.debug(f"[ALPHA] SIZE_TOO_SMALL {_a_coin} {_a_dir} {_a_strat} ${_a_amt:.2f}")
-                        continue
+                        if _a_amt < 5:
+                            logger.debug(f"[ALPHA] SIZE_TOO_SMALL {_a_coin} {_a_dir} {_a_strat} ${_a_amt:.2f}")
+                            continue
 
-                    # ── EXECUTE ──
-                    _a_order_type = "BUY" if _a_dir == "long" else "SHORT"
-                    order = executor.place_order(_a_order_type, _a_coin, _a_price, _a_amt, wallet, prices)
-                    if order["filled"]:
-                        _a_pos_dict = wallet.longs if _a_dir == "long" else wallet.shorts
-                        if _a_coin in _a_pos_dict:
-                            _a_pos_dict[_a_coin]["bought_cycle"] = cycle
-                            _a_pos_dict[_a_coin]["entry_sl"] = _a_sl
-                            _a_pos_dict[_a_coin]["entry_atr"] = _a_atr_pct
-                            _a_pos_dict[_a_coin]["strategy"] = f"alpha_{_a_strat}"
-                            shadow.log_signal(_a_coin, _a_dir, _a_conf, f"alpha_{_a_strat}", taken=True)
-                            overtrading_guard.record_trade(cycle)
-                            market_brain.record_entry(cycle)
-                            recovery_mode.record_trade(cycle)
-                            min_activity.record_trade(cycle)
-                            logger.info(
-                                f"[ALPHA] {_a_order_type} {_a_coin} ${_a_amt:.0f} @ ${order['fill_price']:,.4f} "
-                                f"conf={_a_conf:.2f} strat={_a_strat} slip={order['slippage_pct']:.3f}% "
-                                f"sl={_a_sl:.1f}% macro={alpha_macro.regime} vix={alpha_vix.vol_regime}")
-                            log_trade_entry(_a_coin, _a_dir, f"alpha_{_a_strat}", _a_amt,
-                                            order['fill_price'], _a_sl, _a_atr_pct,
-                                            _edge_size_multiplier(), _current_regime, cycle)
-                            _alpha_taken += 1
-                            _alpha_position_count += 1
-                    elif not order["filled"]:
-                        shadow.log_signal(_a_coin, _a_dir, _a_conf, f"alpha_{_a_strat}_rejected:{order['reject_reason']}", taken=False)
-                        pair_failure_tracker.record_failure(_a_coin, cycle)
+                        # ── EXECUTE ──
+                        _a_order_type = "BUY" if _a_dir == "long" else "SHORT"
+                        order = executor.place_order(_a_order_type, _a_coin, _a_price, _a_amt, wallet, prices)
+                        if order["filled"]:
+                            _a_pos_dict = wallet.longs if _a_dir == "long" else wallet.shorts
+                            if _a_coin in _a_pos_dict:
+                                _a_pos_dict[_a_coin]["bought_cycle"] = cycle
+                                _a_pos_dict[_a_coin]["entry_sl"] = _a_sl
+                                _a_pos_dict[_a_coin]["entry_atr"] = _a_atr_pct
+                                _a_pos_dict[_a_coin]["strategy"] = f"alpha_{_a_strat}"
+                                shadow.log_signal(_a_coin, _a_dir, _a_conf, f"alpha_{_a_strat}", taken=True)
+                                overtrading_guard.record_trade(cycle)
+                                market_brain.record_entry(cycle)
+                                recovery_mode.record_trade(cycle)
+                                min_activity.record_trade(cycle)
+                                logger.info(
+                                    f"[ALPHA] {_a_order_type} {_a_coin} ${_a_amt:.0f} @ ${order['fill_price']:,.4f} "
+                                    f"conf={_a_conf:.2f} strat={_a_strat} slip={order['slippage_pct']:.3f}% "
+                                    f"sl={_a_sl:.1f}% macro={alpha_macro.regime} vix={alpha_vix.vol_regime}")
+                                log_trade_entry(_a_coin, _a_dir, f"alpha_{_a_strat}", _a_amt,
+                                                order['fill_price'], _a_sl, _a_atr_pct,
+                                                _edge_size_multiplier(), _current_regime, cycle)
+                                _alpha_taken += 1
+                                _alpha_position_count += 1
+                        elif not order["filled"]:
+                            shadow.log_signal(_a_coin, _a_dir, _a_conf, f"alpha_{_a_strat}_rejected:{order['reject_reason']}", taken=False)
+                            pair_failure_tracker.record_failure(_a_coin, cycle)
 
-                if _alpha_taken > 0:
-                    logger.info(f"[ALPHA] cycle={cycle} entries_taken={_alpha_taken}")
+                    if _alpha_taken > 0:
+                        logger.info(f"[ALPHA] cycle={cycle} entries_taken={_alpha_taken}")
 
             # ── RECOVERY FALLBACK: DISABLED ──
             # Optimized change – blind recovery trades lose money; human traders wait for signals
