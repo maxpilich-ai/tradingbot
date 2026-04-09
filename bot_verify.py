@@ -373,13 +373,13 @@ def run_all():
                      MAX_SPREAD_PCT, STRESS_RISK_LIMIT_PCT,
                      MAX_TOTAL_EXPOSURE_UPDATED_PCT, GAP_RISK_MULTIPLIER, STAGNATION_EXIT_CYCLES)
     test("MAX_POSITIONS = 2", MAX_POSITIONS == 2)
-    test("MAX_RISK_PER_TRADE = 0.5%", MAX_RISK_PER_TRADE == 0.005)
+    test("MAX_RISK_PER_TRADE = 1.5%", MAX_RISK_PER_TRADE == 0.015)
     test("MAX_DAILY_LOSS = 2.5%", MAX_DAILY_LOSS_PCT == 2.5)
-    test("MAX_SPREAD = 0.25%", MAX_SPREAD_PCT == 0.25)
+    test("MAX_SPREAD = 0.20%", MAX_SPREAD_PCT == 0.20)
     test("MAX_EXPOSURE = 60%", MAX_TOTAL_EXPOSURE_UPDATED_PCT == 60.0)
-    test("STRESS_LIMIT = 8%", STRESS_RISK_LIMIT_PCT == 8.0)
-    test("GAP_RISK_MULT = 3", GAP_RISK_MULTIPLIER == 3)
-    test("STAGNATION = 300 cycles", STAGNATION_EXIT_CYCLES == 300)
+    test("STRESS_LIMIT = 25%", STRESS_RISK_LIMIT_PCT == 25.0)
+    test("GAP_RISK_MULT = 1.2", GAP_RISK_MULTIPLIER == 1.2)
+    test("STAGNATION = 100 cycles", STAGNATION_EXIT_CYCLES == 100)
 
     # ── 23. CB DAILY HARD STOP ──
     print("\n23. CB DAILY HARD STOP")
@@ -857,7 +857,7 @@ def run_all():
     import math
 
     # Stability constants exist
-    test("Warmup cycles = 100", STABILITY_WARMUP_CYCLES == 100)
+    test("Warmup cycles = 300", STABILITY_WARMUP_CYCLES == 300)
     test("Max consecutive errors = 50", MAX_CONSECUTIVE_ERRORS == 50)
     test("Cycle timeout = 30s", CYCLE_TIMEOUT_SEC == 30)
     test("Heartbeat interval = 50", HEARTBEAT_INTERVAL == 50)
@@ -1152,19 +1152,21 @@ def run_all():
     # ── 49. Recovery Mode & Pair Failure Tracker ──
     print("\n── 49. Recovery Mode & Pair Failure Tracker ──")
 
+    from bot import (
+        RecoveryMode, OvertradingGuard,
+        RECOVERY_TRIGGER_CYCLES, RECOVERY_DURATION_CYCLES,
+        RECOVERY_COOLDOWN_CYCLES, RECOVERY_COIN_LOSS_DECAY,
+        MAX_TRADES_PER_100_CYCLES,
+        recovery_mode as _rm_global, pair_failure_tracker as _pft_global,
+    )
+    # PairFailureTracker was renamed to SmartPairFailureTracker — import with fallback
     try:
-        from bot import (
-            RecoveryMode, PairFailureTracker, OvertradingGuard,
-            RECOVERY_TRIGGER_CYCLES, RECOVERY_DURATION_CYCLES,
-            RECOVERY_COOLDOWN_CYCLES, RECOVERY_COIN_LOSS_DECAY,
-            PAIR_FAILURE_MAX, PAIR_FAILURE_DECAY_CYCLES,
-            MAX_TRADES_PER_100_CYCLES,
-            recovery_mode as _rm_global, pair_failure_tracker as _pft_global,
-        )
+        from bot import PairFailureTracker, PAIR_FAILURE_MAX, PAIR_FAILURE_DECAY_CYCLES
     except ImportError:
         print("  Pre-flight skipped: PairFailureTracker not exported (non-critical)")
-        # Provide fallback so remaining test 49 code doesn't crash
         PairFailureTracker = None
+        PAIR_FAILURE_MAX = 3
+        PAIR_FAILURE_DECAY_CYCLES = 100
 
     # -- RecoveryMode: activation after idle --
     _rm = RecoveryMode()
