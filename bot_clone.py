@@ -9776,14 +9776,13 @@ def preflight_sizing_report(wallet_ref, prices_ref, ranked_list, pair_names_map,
 
 def smc_ict_signal(coin, prices):
     """
-    SMC/ICT Strategy: Liquidity Sweep + FVG + Order Block
+    SMC/ICT Strategy: Liquidity Sweep + FVG + Order Block (LONG + SHORT)
     Returns (direction, confidence_score, entry_price, stop_pct, tp_pct) or None
     Rules:
     - Find swing low/high (support/resistance) on last 50 candles
-    - Detect liquidity sweep: price breaks below swing low by 0.3-0.8%
-    - Find FVG: 3-candle structure where candle 2 is large, gap between c1.low and c3.high
-    - Entry: price pulls back into FVG zone (50-75% depth)
-    - Stop: below sweep low, max 1.5%
+    - LONG: sweep below swing low by 0.3-0.8%, FVG on recovery, entry in FVG zone
+    - SHORT: sweep above swing high by 0.3-0.8%, FVG on drop, entry in FVG zone
+    - Stop: beyond sweep extreme + buffer, capped at 1.5%
     - TP: minimum 3x stop (for fee coverage)
     - Score: 0-10 based on conditions met, only trade 6+
     """
@@ -9791,64 +9790,74 @@ def smc_ict_signal(coin, prices):
         return None
     try:
         recent = prices[-50:]
-
-        # Find swing low (support)
-        swing_low = min(recent[-30:-5])
-        swing_low_idx = recent.index(swing_low) if swing_low in recent else -1
         current = prices[-1]
         prev5 = prices[-6:-1]
 
-        # Detect sweep: price went below swing_low then recovered
-        swept = any(p < swing_low * 0.997 for p in prev5)  # 0.3% sweep minimum
-        if not swept:
-            return None
+        # ── LONG SETUP: sweep below swing low ──
+        swing_low = min(recent[-30:-5])
+        swept_low = any(p < swing_low * 0.997 for p in prev5)  # 0.3% sweep minimum
 
-        sweep_low = min(prev5)
-        sweep_pct = (swing_low - sweep_low) / swing_low
-        if sweep_pct > 0.008:  # max 0.8% sweep
-            return None
+        if swept_low:
+            sweep_low_val = min(prev5)
+            sweep_pct = (swing_low - sweep_low_val) / swing_low
+            if sweep_pct <= 0.008:  # max 0.8% sweep
+                # Find FVG: gap in last 5 candles after sweep
+                c1_low = prices[-5]
+                c3_high = prices[-3]
+                fvg_low = min(c1_low, c3_high)
+                fvg_high = max(c1_low, c3_high)
+                fvg_size = (fvg_high - fvg_low) / fvg_low if fvg_low > 0 else 0
+                if fvg_size >= 0.002:  # FVG must be at least 0.2%
+                    fvg_entry_low = fvg_low + (fvg_high - fvg_low) * 0.25
+                    fvg_entry_high = fvg_low + (fvg_high - fvg_low) * 0.75
+                    if fvg_entry_low <= current <= fvg_entry_high:
+                        score = 0
+                        if sweep_pct >= 0.003: score += 3
+                        if fvg_size >= 0.004: score += 2
+                        if current <= fvg_entry_high: score += 2
+                        if current > sweep_low_val * 1.001: score += 2
+                        if len([p for p in recent[-10:] if p > swing_low]) > 5: score += 1
+                        if score >= 6:
+                            stop_pct = max(0.3, sweep_pct * 100 + 0.3)
+                            stop_pct = min(stop_pct, 1.5)
+                            tp_pct = max(stop_pct * 3.0, 3.0)
+                            logger.info(f"[SMC/ICT] {coin} LONG signal: score={score}/10 sweep={sweep_pct*100:.2f}% "
+                                         f"fvg={fvg_size*100:.2f}% stop={stop_pct:.2f}% tp={tp_pct:.2f}%")
+                            return ("long", score, current, stop_pct, tp_pct)
 
-        # Find FVG: look for gap in last 5 candles after sweep
-        # Simplified: large candle followed by recovery leaves imbalance
-        if len(prices) < 5:
-            return None
-        c1_low = prices[-5]
-        c3_high = prices[-3]
-        fvg_low = min(c1_low, c3_high)
-        fvg_high = max(c1_low, c3_high)
-        fvg_size = (fvg_high - fvg_low) / fvg_low
-        if fvg_size < 0.002:  # FVG must be at least 0.2%
-            return None
+        # ── SHORT SETUP: sweep above swing high ──
+        swing_high = max(recent[-30:-5])
+        swept_high = any(p > swing_high * 1.003 for p in prev5)  # 0.3% sweep minimum
 
-        # Entry: price currently in FVG zone (50-75% depth from top)
-        fvg_entry_low = fvg_low + (fvg_high - fvg_low) * 0.25
-        fvg_entry_high = fvg_low + (fvg_high - fvg_low) * 0.75
-        in_fvg = fvg_entry_low <= current <= fvg_entry_high
-        if not in_fvg:
-            return None
+        if swept_high:
+            sweep_high_val = max(prev5)
+            sweep_pct_s = (sweep_high_val - swing_high) / swing_high
+            if sweep_pct_s <= 0.008:  # max 0.8% sweep
+                # Find FVG on the way down
+                c1_high = prices[-5]
+                c3_low = prices[-3]
+                fvg_low_s = min(c1_high, c3_low)
+                fvg_high_s = max(c1_high, c3_low)
+                fvg_size_s = (fvg_high_s - fvg_low_s) / fvg_low_s if fvg_low_s > 0 else 0
+                if fvg_size_s >= 0.002:
+                    fvg_entry_low_s = fvg_low_s + (fvg_high_s - fvg_low_s) * 0.25
+                    fvg_entry_high_s = fvg_low_s + (fvg_high_s - fvg_low_s) * 0.75
+                    if fvg_entry_low_s <= current <= fvg_entry_high_s:
+                        score_s = 0
+                        if sweep_pct_s >= 0.003: score_s += 3
+                        if fvg_size_s >= 0.004: score_s += 2
+                        if current >= fvg_entry_low_s: score_s += 2
+                        if current < sweep_high_val * 0.999: score_s += 2
+                        if len([p for p in recent[-10:] if p < swing_high]) > 5: score_s += 1
+                        if score_s >= 6:
+                            stop_pct_s = max(0.3, sweep_pct_s * 100 + 0.3)
+                            stop_pct_s = min(stop_pct_s, 1.5)
+                            tp_pct_s = max(stop_pct_s * 3.0, 3.0)
+                            logger.info(f"[SMC/ICT] {coin} SHORT signal: score={score_s}/10 sweep={sweep_pct_s*100:.2f}% "
+                                         f"fvg={fvg_size_s*100:.2f}% stop={stop_pct_s:.2f}% tp={tp_pct_s:.2f}%")
+                            return ("short", score_s, current, stop_pct_s, tp_pct_s)
 
-        # Score the setup
-        score = 0
-        if sweep_pct >= 0.003: score += 3  # clean sweep
-        if fvg_size >= 0.004: score += 2    # large FVG
-        if current <= fvg_entry_high: score += 2  # price in entry zone
-        if current > sweep_low * 1.001: score += 2  # recovery confirmed
-        if len([p for p in recent[-10:] if p > swing_low]) > 5: score += 1  # bullish bias
-
-        if score < 6:
-            return None
-
-        # Stop: below sweep low + buffer, capped at 1.5%
-        stop_pct = max(1.0, sweep_pct * 100 + 0.3)  # sweep depth + 0.3% buffer
-        stop_pct = min(stop_pct, 1.5)  # hard cap at 1.5%
-
-        # TP: minimum 3x stop for fee coverage (0.52% RT on Kraken)
-        tp_pct = max(stop_pct * 3.0, 3.0)  # at least 3x R:R or 3.0% absolute floor
-
-        logger.info(f"[SMC/ICT] {coin} LONG signal: score={score}/10 sweep={sweep_pct*100:.2f}% "
-                     f"fvg={fvg_size*100:.2f}% stop={stop_pct:.2f}% tp={tp_pct:.2f}%")
-
-        return ("long", score, current, stop_pct, tp_pct)
+        return None
 
     except Exception as e:
         logger.debug(f"[SMC/ICT] {coin} error: {e}")
@@ -13178,22 +13187,24 @@ def main():
                     smc_result = smc_ict_signal(coin, hist)
                     if smc_result:
                         direction, conf, smc_entry, smc_stop, smc_tp = smc_result
-                        if direction == "long" and conf >= 6:
-                            logger.info(f"[SMC_ICT] {coin} LONG score={conf}/10 entry={smc_entry:.4f} stop={smc_stop:.2f}% tp={smc_tp:.2f}%")
-                            # Safety gates (same as momentum longs)
+                        _smc_tp_adjusted = smc_tp * (adaptive_tp_ratio(coin) / 3.2)  # v29.5.0: scale TP by ATR-adaptive ratio
+                        if conf >= 6:
+                            _smc_side_str = "BUY" if direction == "long" else "SHORT"
+                            logger.info(f"[SMC_ICT] {coin} {direction.upper()} score={conf}/10 entry={smc_entry:.4f} stop={smc_stop:.2f}% tp={_smc_tp_adjusted:.2f}%")
+                            # Safety gates (same as momentum entries)
                             if not group_limit_ok(coin, wallet):
-                                shadow.log_signal(coin, "long", conf, "smc_ict_group_limit", taken=False, strategy="smc_ict")
+                                shadow.log_signal(coin, direction, conf, "smc_ict_group_limit", taken=False, strategy="smc_ict")
                                 continue
                             if not liquidity_ok(coin):
-                                shadow.log_signal(coin, "long", conf, "smc_ict_low_liquidity", taken=False, strategy="smc_ict")
+                                shadow.log_signal(coin, direction, conf, "smc_ict_low_liquidity", taken=False, strategy="smc_ict")
                                 continue
                             if not volatility_spike_check(coin):
-                                shadow.log_signal(coin, "long", conf, "smc_ict_vol_spike", taken=False, strategy="smc_ict")
+                                shadow.log_signal(coin, direction, conf, "smc_ict_vol_spike", taken=False, strategy="smc_ict")
                                 continue
                             if coin in _suspicious_coins:
-                                shadow.log_signal(coin, "long", conf, "smc_ict_suspicious", taken=False, strategy="smc_ict")
+                                shadow.log_signal(coin, direction, conf, "smc_ict_suspicious", taken=False, strategy="smc_ict")
                                 continue
-                            # Sizing: Kelly + risk cap (mirrors momentum long sizing)
+                            # Sizing: Kelly + risk cap (mirrors momentum sizing)
                             _smc_atr = coin_atr(coin) * 100
                             _smc_sl = max(0.8, min(smc_stop, 1.5))  # Use SMC stop, floor 0.8%, cap 1.5%
                             _smc_max_risk = wallet.value(prices) * MAX_RISK_PER_TRADE
@@ -13232,29 +13243,30 @@ def main():
                             # Exposure check
                             _smc_exp_ok, _smc_exp_reason = unified_exposure_ok(wallet, prices, coin, _smc_amt, _smc_sl)
                             if not _smc_exp_ok:
-                                shadow.log_signal(coin, "long", conf, f"smc_ict_{_smc_exp_reason}", taken=False, strategy="smc_ict")
+                                shadow.log_signal(coin, direction, conf, f"smc_ict_{_smc_exp_reason}", taken=False, strategy="smc_ict")
                                 continue
                             if not market_depth_ok(coin, _smc_amt, tickers):
-                                shadow.log_signal(coin, "long", conf, "smc_ict_thin_market", taken=False, strategy="smc_ict")
+                                shadow.log_signal(coin, direction, conf, "smc_ict_thin_market", taken=False, strategy="smc_ict")
                                 continue
                             # Execute
                             if _smc_amt > 5:
-                                order = executor.place_order("BUY", coin, t["price"], _smc_amt, wallet, prices)
-                                if order["filled"] and coin in wallet.longs:
-                                    wallet.longs[coin]["strategy"] = "smc_ict"
-                                    wallet.longs[coin]["bought_cycle"] = cycle
-                                    wallet.longs[coin]["entry_sl"] = _smc_sl
-                                    wallet.longs[coin]["entry_atr"] = _smc_atr
-                                    shadow.log_signal(coin, "long", conf, "smc_ict", taken=True, strategy="smc_ict")
+                                order = executor.place_order(_smc_side_str, coin, t["price"], _smc_amt, wallet, prices)
+                                _smc_pos_dict = wallet.longs if direction == "long" else wallet.shorts
+                                if order["filled"] and coin in _smc_pos_dict:
+                                    _smc_pos_dict[coin]["strategy"] = "smc_ict"
+                                    _smc_pos_dict[coin]["bought_cycle"] = cycle
+                                    _smc_pos_dict[coin]["entry_sl"] = _smc_sl
+                                    _smc_pos_dict[coin]["entry_atr"] = _smc_atr
+                                    shadow.log_signal(coin, direction, conf, "smc_ict", taken=True, strategy="smc_ict")
                                     overtrading_guard.record_trade(cycle)
                                     market_brain.record_entry(cycle)
                                     recovery_mode.record_trade(cycle)
                                     min_activity.record_trade(cycle)
-                                    logger.info(f"[SMC_ICT_ENTRY] BUY {coin} ${_smc_amt:.0f} score={conf}/10 sl={_smc_sl:.2f}% tp={smc_tp:.2f}% slip={order['slippage_pct']:.3f}%")
-                                    log_trade_entry(coin, "long", "smc_ict", _smc_amt, order['fill_price'], _smc_sl, _smc_atr, _edge_size_multiplier(), _current_regime, cycle)
+                                    logger.info(f"[SMC_ICT_ENTRY] {_smc_side_str} {coin} ${_smc_amt:.0f} score={conf}/10 sl={_smc_sl:.2f}% tp={_smc_tp_adjusted:.2f}% slip={order['slippage_pct']:.3f}%")
+                                    log_trade_entry(coin, direction, "smc_ict", _smc_amt, order['fill_price'], _smc_sl, _smc_atr, _edge_size_multiplier(), _current_regime, cycle)
                                     break
                                 elif not order["filled"]:
-                                    shadow.log_signal(coin, "long", conf, f"smc_ict_rejected:{order['reject_reason']}", taken=False, strategy="smc_ict")
+                                    shadow.log_signal(coin, direction, conf, f"smc_ict_rejected:{order['reject_reason']}", taken=False, strategy="smc_ict")
                                     pair_failure_tracker.record_failure(coin, cycle)
                             else:
                                 logger.debug(f"SIZE_TOO_SMALL {coin} smc_ict ${_smc_amt:.2f} — skipped (min $5)")
