@@ -9902,6 +9902,300 @@ def mean_rev_aggressive_signal(coin, prices):
     return None
 
 
+# ── v29.6: Dad Strategies — 5m OHLCV helpers + 3 new signals ──
+_OHLCV_CACHE = {}
+_OHLCV_CACHE_TTL = 60  # seconds
+
+def get_ohlcv_candles(coin, interval=5):
+    """Fetch 5-minute OHLCV candles from Kraken for a given coin short name.
+    Returns list of (timestamp, open, high, low, close, volume) tuples, or []."""
+    import time as _t
+    try:
+        now = _t.time()
+        cached = _OHLCV_CACHE.get((coin, interval))
+        if cached and (now - cached[0]) < _OHLCV_CACHE_TTL:
+            return cached[1]
+        # Try common Kraken pair formats
+        candidates = []
+        if coin == "BTC":
+            candidates = ["XXBTZUSD", "XBTUSD"]
+        else:
+            candidates = [f"X{coin}ZUSD", f"{coin}USD", f"{coin}ZUSD"]
+        raw = []
+        for pair in candidates:
+            raw = _fetch_ohlcv(pair, interval=interval)
+            if raw:
+                break
+        out = []
+        for row in raw:
+            try:
+                out.append((
+                    int(row[0]),
+                    float(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[6]) if len(row) > 6 else 0.0,
+                ))
+            except (ValueError, IndexError, TypeError):
+                continue
+        _OHLCV_CACHE[(coin, interval)] = (now, out)
+        return out
+    except Exception as e:
+        logger.debug(f"[OHLCV] fetch failed for {coin}: {e}")
+        return []
+
+
+def ls_fvg_signal(coin):
+    """Liquidity Sweep + FVG strategy on 5m candles.
+    Detects: price sweeps 0.2-1.5% below recent swing low, then bounces, with FVG gap.
+    Score 3-10, trade if >= 6. Returns (direction, score, price, stop_pct, tp_pct) or None."""
+    try:
+        candles = get_ohlcv_candles(coin)
+        if len(candles) < 30:
+            return None
+        recent = candles[-30:]
+        highs = [c[2] for c in recent]
+        lows = [c[3] for c in recent]
+        closes = [c[4] for c in recent]
+        current = closes[-1]
+        if current <= 0:
+            return None
+        # === LONG: sweep below swing low, bounce, bullish FVG ===
+        swing_low = min(lows[-25:-3])
+        sweep_candle = None
+        for i in range(-5, -1):
+            lo = recent[i][3]
+            sweep_pct = (swing_low - lo) / swing_low * 100 if swing_low > 0 else 0
+            if 0.2 <= sweep_pct <= 1.5 and recent[i][4] > lo:
+                sweep_candle = i
+                break
+        if sweep_candle is not None:
+            # Bullish FVG: gap where candle[i+1].low > candle[i-1].high
+            fvg_ok = False
+            try:
+                c_prev = recent[sweep_candle - 1]
+                c_next = recent[sweep_candle + 1] if sweep_candle + 1 < 0 else recent[-1]
+                if c_next[3] > c_prev[2]:
+                    fvg_ok = True
+            except IndexError:
+                pass
+            score = 4
+            sweep_pct_val = (swing_low - recent[sweep_candle][3]) / swing_low * 100
+            if 0.4 <= sweep_pct_val <= 1.0:
+                score += 2
+            if fvg_ok:
+                score += 3
+            if current > recent[sweep_candle][4]:
+                score += 1
+            if score >= 6:
+                stop_pct = max(0.8, sweep_pct_val * 1.2)
+                return ("long", min(10, score), current, stop_pct, stop_pct * 3.2)
+        # === SHORT: sweep above swing high, reject, bearish FVG ===
+        swing_high = max(highs[-25:-3])
+        sweep_candle_s = None
+        for i in range(-5, -1):
+            hi = recent[i][2]
+            sweep_pct = (hi - swing_high) / swing_high * 100 if swing_high > 0 else 0
+            if 0.2 <= sweep_pct <= 1.5 and recent[i][4] < hi:
+                sweep_candle_s = i
+                break
+        if sweep_candle_s is not None:
+            fvg_ok = False
+            try:
+                c_prev = recent[sweep_candle_s - 1]
+                c_next = recent[sweep_candle_s + 1] if sweep_candle_s + 1 < 0 else recent[-1]
+                if c_next[2] < c_prev[3]:
+                    fvg_ok = True
+            except IndexError:
+                pass
+            score = 4
+            sweep_pct_val = (recent[sweep_candle_s][2] - swing_high) / swing_high * 100
+            if 0.4 <= sweep_pct_val <= 1.0:
+                score += 2
+            if fvg_ok:
+                score += 3
+            if current < recent[sweep_candle_s][4]:
+                score += 1
+            if score >= 6:
+                stop_pct = max(0.8, sweep_pct_val * 1.2)
+                return ("short", min(10, score), current, stop_pct, stop_pct * 3.2)
+        return None
+    except Exception as e:
+        logger.debug(f"[LS_FVG] {coin} signal error: {e}")
+        return None
+
+
+def ob_signal(coin):
+    """Order Block strategy on 5m candles.
+    Finds last opposing candle before a 3x+ impulse move, checks if price returned to zone.
+    Score 5-10, trade if >= 6. Returns (direction, score, price, stop_pct, tp_pct) or None."""
+    try:
+        candles = get_ohlcv_candles(coin)
+        if len(candles) < 30:
+            return None
+        recent = candles[-30:]
+        bodies = [abs(c[4] - c[1]) for c in recent]
+        if not bodies:
+            return None
+        avg_body = sum(bodies) / len(bodies)
+        if avg_body <= 0:
+            return None
+        current = recent[-1][4]
+        # === LONG: bearish candle then 3x+ bullish impulse, price returns to OB ===
+        for i in range(-15, -3):
+            candle = recent[i]
+            is_bear = candle[4] < candle[1]
+            if not is_bear:
+                continue
+            # Check next 1-3 candles for bullish impulse
+            impulse_found = False
+            for j in range(1, 4):
+                if i + j >= 0:
+                    break
+                nxt = recent[i + j]
+                body = abs(nxt[4] - nxt[1])
+                if nxt[4] > nxt[1] and body >= 3.0 * avg_body:
+                    impulse_found = True
+                    break
+            if not impulse_found:
+                continue
+            ob_high = candle[2]
+            ob_low = candle[3]
+            # Check if price returned into OB zone
+            if ob_low <= current <= ob_high * 1.002:
+                score = 5
+                if current >= ob_low and current <= (ob_low + ob_high) / 2:
+                    score += 2  # deeper in zone
+                if recent[-1][4] > recent[-1][1]:
+                    score += 1  # current candle bullish
+                if recent[-2][4] > recent[-2][1]:
+                    score += 1
+                if score >= 6:
+                    stop_pct = max(0.8, (current - ob_low * 0.997) / current * 100)
+                    return ("long", min(10, score), current, stop_pct, stop_pct * 3.2)
+        # === SHORT: bullish candle then 3x+ bearish impulse ===
+        for i in range(-15, -3):
+            candle = recent[i]
+            is_bull = candle[4] > candle[1]
+            if not is_bull:
+                continue
+            impulse_found = False
+            for j in range(1, 4):
+                if i + j >= 0:
+                    break
+                nxt = recent[i + j]
+                body = abs(nxt[4] - nxt[1])
+                if nxt[4] < nxt[1] and body >= 3.0 * avg_body:
+                    impulse_found = True
+                    break
+            if not impulse_found:
+                continue
+            ob_high = candle[2]
+            ob_low = candle[3]
+            if ob_low * 0.998 <= current <= ob_high:
+                score = 5
+                if current >= (ob_low + ob_high) / 2 and current <= ob_high:
+                    score += 2
+                if recent[-1][4] < recent[-1][1]:
+                    score += 1
+                if recent[-2][4] < recent[-2][1]:
+                    score += 1
+                if score >= 6:
+                    stop_pct = max(0.8, (ob_high * 1.003 - current) / current * 100)
+                    return ("short", min(10, score), current, stop_pct, stop_pct * 3.2)
+        return None
+    except Exception as e:
+        logger.debug(f"[OB] {coin} signal error: {e}")
+        return None
+
+
+def bp_fvg_signal(coin):
+    """Breakout + Pullback + FVG strategy on 5m candles.
+    Resistance break, pullback to breakout zone, plus FVG confirmation.
+    Score 4-10, trade if >= 6. Returns (direction, score, price, stop_pct, tp_pct) or None."""
+    try:
+        candles = get_ohlcv_candles(coin)
+        if len(candles) < 30:
+            return None
+        recent = candles[-30:]
+        highs = [c[2] for c in recent]
+        lows = [c[3] for c in recent]
+        closes = [c[4] for c in recent]
+        current = closes[-1]
+        if current <= 0:
+            return None
+        # === LONG: resistance break, pullback to break zone, bullish FVG ===
+        resistance = max(highs[-25:-8])
+        break_idx = None
+        for i in range(-8, -2):
+            if recent[i][4] > resistance:
+                break_idx = i
+                break
+        if break_idx is not None:
+            # Check pullback: later candle low within 0.5% of resistance
+            pullback_ok = False
+            for j in range(break_idx + 1, 0):
+                if abs(recent[j][3] - resistance) / resistance < 0.005:
+                    pullback_ok = True
+                    break
+            fvg_ok = False
+            try:
+                if len(recent) >= 3:
+                    if recent[-1][3] > recent[-3][2]:
+                        fvg_ok = True
+            except IndexError:
+                pass
+            score = 4
+            if pullback_ok:
+                score += 2
+            if fvg_ok:
+                score += 2
+            if current > resistance:
+                score += 1
+            if recent[-1][4] > recent[-1][1]:
+                score += 1
+            if score >= 6:
+                stop_pct = max(0.8, (current - resistance * 0.995) / current * 100)
+                return ("long", min(10, score), current, stop_pct, stop_pct * 3.2)
+        # === SHORT: support break, pullback, bearish FVG ===
+        support = min(lows[-25:-8])
+        break_idx_s = None
+        for i in range(-8, -2):
+            if recent[i][4] < support:
+                break_idx_s = i
+                break
+        if break_idx_s is not None:
+            pullback_ok = False
+            for j in range(break_idx_s + 1, 0):
+                if abs(recent[j][2] - support) / support < 0.005:
+                    pullback_ok = True
+                    break
+            fvg_ok = False
+            try:
+                if len(recent) >= 3:
+                    if recent[-1][2] < recent[-3][3]:
+                        fvg_ok = True
+            except IndexError:
+                pass
+            score = 4
+            if pullback_ok:
+                score += 2
+            if fvg_ok:
+                score += 2
+            if current < support:
+                score += 1
+            if recent[-1][4] < recent[-1][1]:
+                score += 1
+            if score >= 6:
+                stop_pct = max(0.8, (support * 1.005 - current) / current * 100)
+                return ("short", min(10, score), current, stop_pct, stop_pct * 3.2)
+        return None
+    except Exception as e:
+        logger.debug(f"[BP_FVG] {coin} signal error: {e}")
+        return None
+
+
 # ── v29.5.0: SMC Order Block Signal ──
 def smc_ob_signal(coin, prices, direction):
     """
@@ -13242,6 +13536,52 @@ def main():
                                      stop_loss=_mr_entry*(1+_mr_stop/100),
                                      take_profit=_mr_entry*(1-_mr_tp/100))
                         logger.info(f"[MR_ENTRY] {_mr_coin} SHORT score={_mr_score} | ${_mr_size:.2f}")
+
+            # ── v29.6: DAD STRATEGIES — LS+FVG / OB / BP+FVG on 5m OHLCV ──
+            _dad_strats = []
+            if cycle % 3 == 0:
+                _dad_strats.append(("ls_fvg", ls_fvg_signal))
+            if cycle % 5 == 0:
+                _dad_strats.append(("ob", ob_signal))
+            if cycle % 7 == 0:
+                _dad_strats.append(("bp_fvg", bp_fvg_signal))
+            if _dad_strats and _kill_switch_ok:
+                for _dad_name, _dad_fn in _dad_strats:
+                    if len(wallet.longs) + len(wallet.shorts) >= MAX_POSITIONS:
+                        break
+                    for _dad_coin in list(COIN_WHITELIST)[:5]:
+                        if not _kill_switch_ok:
+                            break
+                        if len(wallet.longs) + len(wallet.shorts) >= MAX_POSITIONS:
+                            break
+                        if _dad_coin in DYNAMIC_BLACKLIST:
+                            continue
+                        if _dad_coin in wallet.longs or _dad_coin in wallet.shorts:
+                            continue
+                        try:
+                            _dad_result = _dad_fn(_dad_coin)
+                        except Exception as _dad_err:
+                            logger.debug(f"[DAD:{_dad_name}] {_dad_coin} error: {_dad_err}")
+                            continue
+                        if _dad_result is None:
+                            continue
+                        _dad_dir, _dad_score, _dad_entry, _dad_stop, _dad_tp = _dad_result
+                        _dad_pv = wallet.portfolio_value()
+                        _dad_size = _dad_pv * MAX_RISK_PER_TRADE
+                        _dad_size = min(_dad_size, _dad_pv * MAX_SINGLE_COIN_EXPOSURE_PCT / 100)
+                        _dad_size = max(MIN_ORDER_USD, _dad_size)
+                        if _dad_size < MIN_ORDER_USD:
+                            continue
+                        if _dad_dir == "long":
+                            wallet.buy(_dad_coin, _dad_size, _dad_entry, f"dad_{_dad_name}",
+                                       stop_loss=_dad_entry * (1 - _dad_stop / 100),
+                                       take_profit=_dad_entry * (1 + _dad_tp / 100))
+                            logger.info(f"[DAD:{_dad_name.upper()}] {_dad_coin} LONG score={_dad_score}/10 | ${_dad_size:.2f} | stop={_dad_stop:.2f}% tp={_dad_tp:.2f}%")
+                        elif _dad_dir == "short":
+                            wallet.short(_dad_coin, _dad_size, _dad_entry, f"dad_{_dad_name}",
+                                         stop_loss=_dad_entry * (1 + _dad_stop / 100),
+                                         take_profit=_dad_entry * (1 - _dad_tp / 100))
+                            logger.info(f"[DAD:{_dad_name.upper()}] {_dad_coin} SHORT score={_dad_score}/10 | ${_dad_size:.2f} | stop={_dad_stop:.2f}% tp={_dad_tp:.2f}%")
 
             # ── v29.4.1: SMC/ICT STRATEGY — Liquidity Sweep + FVG + Order Block ──
             if (not warmup_blocked and _api_ok and _usable_cash > 50
