@@ -9908,6 +9908,7 @@ _OHLCV_CACHE_TTL = 60  # seconds
 
 def get_ohlcv_candles(coin, interval=5):
     """Fetch 5-minute OHLCV candles from Kraken for a given coin short name.
+    Uses pair_names_cache (populated from Kraken AssetPairs) for pair lookup.
     Returns list of (timestamp, open, high, low, close, volume) tuples, or []."""
     import time as _t
     try:
@@ -9915,17 +9916,26 @@ def get_ohlcv_candles(coin, interval=5):
         cached = _OHLCV_CACHE.get((coin, interval))
         if cached and (now - cached[0]) < _OHLCV_CACHE_TTL:
             return cached[1]
-        # Try common Kraken pair formats
-        candidates = []
-        if coin == "BTC":
-            candidates = ["XXBTZUSD", "XBTUSD"]
-        else:
-            candidates = [f"X{coin}ZUSD", f"{coin}USD", f"{coin}ZUSD"]
+        # v29.6.1: Resolve coin→pair via pair_names_cache (Kraken AssetPairs dict)
+        # pair_names_cache is {pair_key: altname}; reverse-match via to_short_name
+        pair_key = None
+        try:
+            for _pk, _alt in pair_names_cache.items():
+                if to_short_name(_alt) == coin or to_short_name(_pk) == coin:
+                    pair_key = _pk
+                    break
+        except Exception:
+            pair_key = None
         raw = []
-        for pair in candidates:
-            raw = _fetch_ohlcv(pair, interval=interval)
-            if raw:
-                break
+        if pair_key:
+            raw = _fetch_ohlcv(pair_key, interval=interval)
+        if not raw:
+            # Fallback: standard altname formats
+            fallback = ["XXBTZUSD", "XBTUSD"] if coin == "BTC" else [f"{coin}USD", f"X{coin}ZUSD"]
+            for pair in fallback:
+                raw = _fetch_ohlcv(pair, interval=interval)
+                if raw:
+                    break
         out = []
         for row in raw:
             try:
@@ -13554,34 +13564,45 @@ def main():
                             break
                         if len(wallet.longs) + len(wallet.shorts) >= MAX_POSITIONS:
                             break
+                        # v29.6.1: per-coin DEAD regime check inside loop
+                        if _pro_market_regime == "DEAD":
+                            continue
                         if _dad_coin in DYNAMIC_BLACKLIST:
                             continue
                         if _dad_coin in wallet.longs or _dad_coin in wallet.shorts:
                             continue
                         try:
-                            _dad_result = _dad_fn(_dad_coin)
+                            _dr = _dad_fn(_dad_coin)
                         except Exception as _dad_err:
                             logger.debug(f"[DAD:{_dad_name}] {_dad_coin} error: {_dad_err}")
                             continue
-                        if _dad_result is None:
+                        # v29.6.1: safety check before unpack — must be tuple of 5
+                        if not _dr or not isinstance(_dr, (tuple, list)) or len(_dr) != 5:
                             continue
-                        _dad_dir, _dad_score, _dad_entry, _dad_stop, _dad_tp = _dad_result
+                        _dad_dir, _dad_score, _dad_entry, _dad_stop, _dad_tp = _dr
+                        if _dad_entry is None or _dad_entry <= 0:
+                            continue
                         _dad_pv = wallet.portfolio_value()
                         _dad_size = _dad_pv * MAX_RISK_PER_TRADE
                         _dad_size = min(_dad_size, _dad_pv * MAX_SINGLE_COIN_EXPOSURE_PCT / 100)
                         _dad_size = max(MIN_ORDER_USD, _dad_size)
                         if _dad_size < MIN_ORDER_USD:
                             continue
-                        if _dad_dir == "long":
-                            wallet.buy(_dad_coin, _dad_size, _dad_entry, f"dad_{_dad_name}",
-                                       stop_loss=_dad_entry * (1 - _dad_stop / 100),
-                                       take_profit=_dad_entry * (1 + _dad_tp / 100))
-                            logger.info(f"[DAD:{_dad_name.upper()}] {_dad_coin} LONG score={_dad_score}/10 | ${_dad_size:.2f} | stop={_dad_stop:.2f}% tp={_dad_tp:.2f}%")
-                        elif _dad_dir == "short":
-                            wallet.short(_dad_coin, _dad_size, _dad_entry, f"dad_{_dad_name}",
-                                         stop_loss=_dad_entry * (1 + _dad_stop / 100),
-                                         take_profit=_dad_entry * (1 - _dad_tp / 100))
-                            logger.info(f"[DAD:{_dad_name.upper()}] {_dad_coin} SHORT score={_dad_score}/10 | ${_dad_size:.2f} | stop={_dad_stop:.2f}% tp={_dad_tp:.2f}%")
+                        # v29.6.1: use executor.place_order + set entry_sl, matching existing strategy pattern
+                        _dad_side = "BUY" if _dad_dir == "long" else "SHORT"
+                        try:
+                            _dad_order = executor.place_order(_dad_side, _dad_coin, _dad_entry, _dad_size, wallet, prices)
+                        except Exception as _dad_oe:
+                            logger.debug(f"[DAD:{_dad_name}] {_dad_coin} place_order error: {_dad_oe}")
+                            continue
+                        if _dad_order and _dad_order.get("filled"):
+                            _dad_pos_book = wallet.longs if _dad_dir == "long" else wallet.shorts
+                            if _dad_coin in _dad_pos_book:
+                                _dad_pos_book[_dad_coin]["entry_sl"] = max(0.8, _dad_stop)
+                                _dad_pos_book[_dad_coin]["strategy"] = f"dad_{_dad_name}"
+                                _dad_pos_book[_dad_coin]["bought_cycle"] = cycle
+                                _dad_pos_book[_dad_coin]["entry_atr"] = coin_atr(_dad_coin) * 100 if coin_atr(_dad_coin) else _dad_stop
+                            logger.info(f"[DAD:{_dad_name.upper()}] {_dad_coin} {_dad_dir.upper()} score={_dad_score}/10 | ${_dad_size:.2f} | stop={_dad_stop:.2f}% tp={_dad_tp:.2f}%")
 
             # ── v29.4.1: SMC/ICT STRATEGY — Liquidity Sweep + FVG + Order Block ──
             if (not warmup_blocked and _api_ok and _usable_cash > 50
